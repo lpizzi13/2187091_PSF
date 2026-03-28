@@ -1,0 +1,81 @@
+services:
+  # 1. Simulatore fornito (da caricare con docker load)
+  simulator:
+    image: seismic-signal-simulator:multiarch_v1
+    container_name: seismic-simulator
+    ports:
+      - "8080:8080"
+    environment:
+      - SAMPLING_RATE_HZ=20.0
+      - AUTO_SHUTDOWN_ENABLED=true
+      - AUTO_SHUTDOWN_MIN_SECONDS=30.0
+      - AUTO_SHUTDOWN_MAX_SECONDS=90.0
+    networks:
+      - seismic-net
+
+  # 2. Database condiviso (PostgreSQL)
+  db:
+    image: mysql:8.0
+    container_name: seismic-db
+    restart: always
+    environment:
+      - MYSQL_DATABASE=seismic_db
+      - MYSQL_USER=admin
+      - MYSQL_PASSWORD=secret
+      - MYSQL_ROOT_PASSWORD=root_secret
+    volumes:
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - seismic-net
+
+  # 3. Custom Broker (Regione Neutrale)
+  broker:
+    build: ./broker
+    container_name: seismic-broker
+    depends_on:
+      - simulator
+    environment:
+      - SIMULATOR_URL=http://simulator:8080
+    networks:
+      - seismic-net
+
+  # 4. Processing Service (Replicato)
+  replica:
+    build: ./processing-replica
+    deploy:
+      replicas: 3
+    depends_on:
+      - db
+      - broker
+    environment:
+      - DB_URL=postgresql://admin:secret@db:5432/seismic_db
+      - SIMULATOR_CONTROL_URL=http://simulator:8080/api/control
+      - BROKER_URL=ws://broker:8000/data
+    networks:
+      - seismic-net
+
+  # 5. API Gateway (Regione Neutrale)
+  gateway:
+    build: ./gateway
+    container_name: seismic-gateway
+    ports:
+      - "80:80"
+    depends_on:
+      - replica
+    networks:
+      - seismic-net
+
+  # 6. Frontend Dashboard
+  dashboard:
+    build: ./dashboard
+    container_name: seismic-dashboard
+    ports:
+      - "3000:3000"
+    depends_on:
+      - gateway
+    networks:
+      - seismic-net
+
+networks:
+  seismic-net:
+    driver: bridge
