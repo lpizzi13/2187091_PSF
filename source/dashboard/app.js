@@ -4,7 +4,6 @@ const REPLICA_RECOVERY_MS = 12000;
 const HEALTH_POLL_MS = 4000;
 const ARCHIVE_POLL_MS = 12000;
 let MAX_LIVE_EVENTS = 12;
-let MAX_ARCHIVE_ROWS = 8;
 let MAX_LOG_ROWS = 16;
 
 const dom = {
@@ -15,6 +14,11 @@ const dom = {
   streamState: document.getElementById("streamState"),
   liveEventsBody: document.getElementById("liveEventsBody"),
   archiveBody: document.getElementById("archiveBody"),
+  archiveSearch: document.getElementById("archiveSearch"),
+  archiveClassification: document.getElementById("archiveClassification"),
+  archiveReplica: document.getElementById("archiveReplica"),
+  archiveReset: document.getElementById("archiveReset"),
+  archiveSummary: document.getElementById("archiveSummary"),
   systemLogs: document.getElementById("systemLogs"),
   radarBlips: document.getElementById("radarBlips"),
   analysisTitle: document.getElementById("analysisTitle"),
@@ -40,6 +44,11 @@ const state = {
   sensorsFromEvents: new Set(),
   knownSensors: 0,
   selectedEventId: null,
+  archiveFilters: {
+    search: "",
+    classification: "",
+    replica: "",
+  },
 };
 
 function nowIso() {
@@ -103,6 +112,14 @@ function classificationCss(value) {
   return `class-${value.toLowerCase()}`;
 }
 
+function archiveFilterActive() {
+  return Boolean(
+    state.archiveFilters.search ||
+    state.archiveFilters.classification ||
+    state.archiveFilters.replica
+  );
+}
+
 function severityFromClassification(value) {
   if (value === "nuclear_like") {
     return "fail";
@@ -128,19 +145,15 @@ function applyDensityProfile() {
 
   if (h < 680 || w < 980) {
     MAX_LIVE_EVENTS = 6;
-    MAX_ARCHIVE_ROWS = 5;
     MAX_LOG_ROWS = 8;
   } else if (h < 820 || w < 1200) {
     MAX_LIVE_EVENTS = 8;
-    MAX_ARCHIVE_ROWS = 6;
     MAX_LOG_ROWS = 11;
   } else if (h < 980) {
     MAX_LIVE_EVENTS = 10;
-    MAX_ARCHIVE_ROWS = 7;
     MAX_LOG_ROWS = 14;
   } else {
     MAX_LIVE_EVENTS = 12;
-    MAX_ARCHIVE_ROWS = 8;
     MAX_LOG_ROWS = 18;
   }
 
@@ -409,6 +422,8 @@ function updateArchiveEvents(events) {
   if (!state.selectedEventId && state.archiveEvents.length > 0) {
     state.selectedEventId = state.archiveEvents[0].event_id;
   }
+
+  refreshArchiveFilterOptions();
 }
 
 async function loadArchiveEvents() {
@@ -495,6 +510,7 @@ function connectEventStream() {
     if (state.archiveEvents.every((row) => row.event_id !== normalized.event_id)) {
       state.archiveEvents.unshift(normalized);
       state.archiveEvents = state.archiveEvents.slice(0, 80);
+      refreshArchiveFilterOptions();
     }
 
     pushLog(
@@ -630,11 +646,108 @@ function renderLiveTable() {
   }
 }
 
+function syncArchiveSelectOptions(select, options, emptyLabel, selectedValue) {
+  const signature = options.map((option) => `${option.value}:${option.label}`).join("|");
+  const nextValue = options.some((option) => option.value === selectedValue) ? selectedValue : "";
+
+  if (select.dataset.signature !== signature) {
+    const fragment = document.createDocumentFragment();
+
+    const emptyOption = document.createElement("option");
+    emptyOption.value = "";
+    emptyOption.textContent = emptyLabel;
+    fragment.append(emptyOption);
+
+    for (const option of options) {
+      const element = document.createElement("option");
+      element.value = option.value;
+      element.textContent = option.label;
+      fragment.append(element);
+    }
+
+    select.replaceChildren(fragment);
+    select.dataset.signature = signature;
+  }
+
+  if (select.value !== nextValue) {
+    select.value = nextValue;
+  }
+
+  return nextValue;
+}
+
+function refreshArchiveFilterOptions() {
+  const classificationOptions = [...new Set(state.archiveEvents.map((event) => event.classification))]
+    .filter(Boolean)
+    .sort()
+    .map((value) => ({ value, label: classificationLabel(value) }));
+
+  const replicaOptions = [...new Set(
+    state.archiveEvents
+      .map((event) => event.detected_by)
+      .filter((value) => typeof value === "string" && value.length > 0)
+  )]
+    .map((value) => ({ value, label: replicaLabel(value) }))
+    .sort((a, b) => a.label.localeCompare(b.label, undefined, { numeric: true }));
+
+  state.archiveFilters.classification = syncArchiveSelectOptions(
+    dom.archiveClassification,
+    classificationOptions,
+    "ALL TYPES",
+    state.archiveFilters.classification
+  );
+
+  state.archiveFilters.replica = syncArchiveSelectOptions(
+    dom.archiveReplica,
+    replicaOptions,
+    "ALL REPLICAS",
+    state.archiveFilters.replica
+  );
+}
+
+function archiveSearchHaystack(event) {
+  return [
+    event.event_id,
+    shortId(event.event_id),
+    event.sensor_id,
+    event.region,
+    classificationLabel(event.classification),
+    event.detected_by,
+    event.detected_by ? replicaLabel(event.detected_by) : null,
+  ]
+    .filter((value) => typeof value === "string" && value.length > 0)
+    .join(" ")
+    .toLowerCase();
+}
+
+function getFilteredArchiveEvents() {
+  const query = state.archiveFilters.search.trim().toLowerCase();
+
+  return state.archiveEvents.filter((event) => {
+    if (
+      state.archiveFilters.classification &&
+      event.classification !== state.archiveFilters.classification
+    ) {
+      return false;
+    }
+
+    if (state.archiveFilters.replica && event.detected_by !== state.archiveFilters.replica) {
+      return false;
+    }
+
+    if (query && !archiveSearchHaystack(event).includes(query)) {
+      return false;
+    }
+
+    return true;
+  });
+}
+
 function renderArchiveTable() {
-  const rows = state.archiveEvents
-    .slice(0, MAX_ARCHIVE_ROWS)
+  const filteredEvents = getFilteredArchiveEvents();
+  const rows = filteredEvents
     .map((event) => `
-      <tr>
+      <tr data-event-id="${event.event_id}" class="${event.event_id === state.selectedEventId ? "selected" : ""}">
         <td>${toUtcTime(event.timestamp)}</td>
         <td>${shortId(event.event_id)}</td>
         <td class="${classificationCss(event.classification)}">${classificationLabel(event.classification)}</td>
@@ -643,11 +756,24 @@ function renderArchiveTable() {
     `)
     .join("");
 
+  if (archiveFilterActive()) {
+    dom.archiveSummary.textContent = `MATCH ${filteredEvents.length}/${state.archiveEvents.length}`;
+  } else {
+    dom.archiveSummary.textContent = `ROWS ${filteredEvents.length}/${state.archiveEvents.length}`;
+  }
+
   dom.archiveBody.innerHTML = rows || `
     <tr>
-      <td colspan="4">No historical events stored yet.</td>
+      <td colspan="4">${archiveFilterActive() ? "No archived events match the current filters." : "No historical events stored yet."}</td>
     </tr>
   `;
+
+  for (const row of dom.archiveBody.querySelectorAll("tr[data-event-id]")) {
+    row.addEventListener("click", () => {
+      state.selectedEventId = row.dataset.eventId;
+      renderAll();
+    });
+  }
 }
 
 function renderLogs() {
@@ -808,7 +934,7 @@ function renderAnalysis() {
     (event.coordinates && (event.coordinates.lat || event.coordinates.lon)
       ? `${firstDefined([event.coordinates.lat], "-")}, ${firstDefined([event.coordinates.lon], "-")}`
       : "Unknown");
-  dom.detailUtc.textContent = toUtcDateTime(event.timestamp);
+  dom.detailUtc.textContent = toUtcTime(event.timestamp);
   dom.detailFreq.textContent = frequencyText(event.dominant_frequency_hz);
   dom.detailType.textContent = classificationLabel(event.classification);
   dom.detailType.className = classificationCss(event.classification);
@@ -860,11 +986,40 @@ function initResizeHandler() {
   });
 }
 
+function initArchiveFilters() {
+  dom.archiveSearch.addEventListener("input", (event) => {
+    state.archiveFilters.search = event.target.value;
+    renderArchiveTable();
+  });
+
+  dom.archiveClassification.addEventListener("change", (event) => {
+    state.archiveFilters.classification = event.target.value;
+    renderArchiveTable();
+  });
+
+  dom.archiveReplica.addEventListener("change", (event) => {
+    state.archiveFilters.replica = event.target.value;
+    renderArchiveTable();
+  });
+
+  dom.archiveReset.addEventListener("click", () => {
+    state.archiveFilters.search = "";
+    state.archiveFilters.classification = "";
+    state.archiveFilters.replica = "";
+    dom.archiveSearch.value = "";
+    dom.archiveClassification.value = "";
+    dom.archiveReplica.value = "";
+    renderArchiveTable();
+  });
+}
+
 async function boot() {
   applyDensityProfile();
   renderClock();
   setInterval(renderClock, 1000);
   initResizeHandler();
+  initArchiveFilters();
+  refreshArchiveFilterOptions();
 
   pushLog("DASHBOARD INITIALIZED", "ok");
   await loadArchiveEvents();

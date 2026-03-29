@@ -91,6 +91,31 @@
 
       <section class="panel archive-panel">
         <h2>REPLICA ARCHIVE</h2>
+        <div class="archive-toolbar">
+          <label class="filter-field filter-search">
+            <span>SEARCH</span>
+            <input
+              id="archiveSearch"
+              type="search"
+              placeholder="Event ID, sensor, region"
+              autocomplete="off"
+            >
+          </label>
+          <label class="filter-field">
+            <span>CLASSIFICATION</span>
+            <select id="archiveClassification">
+              <option value="">ALL TYPES</option>
+            </select>
+          </label>
+          <label class="filter-field">
+            <span>REPLICA</span>
+            <select id="archiveReplica">
+              <option value="">ALL REPLICAS</option>
+            </select>
+          </label>
+          <button id="archiveReset" class="filter-reset" type="button">RESET</button>
+          <span id="archiveSummary" class="archive-summary">SHOWING 0/0</span>
+        </div>
         <div class="table-wrap">
           <table>
             <thead>
