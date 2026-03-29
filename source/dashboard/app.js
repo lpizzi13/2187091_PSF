@@ -1,0 +1,882 @@
+const EXPECTED_REPLICAS = 3;
+const REPLICA_STALE_MS = 18000;
+const REPLICA_RECOVERY_MS = 12000;
+const HEALTH_POLL_MS = 4000;
+const ARCHIVE_POLL_MS = 12000;
+let MAX_LIVE_EVENTS = 12;
+let MAX_ARCHIVE_ROWS = 8;
+let MAX_LOG_ROWS = 16;
+
+const dom = {
+  utcNow: document.getElementById("utcNow"),
+  systemStatus: document.getElementById("systemStatus"),
+  replicaStrip: document.getElementById("replicaStrip"),
+  sensorCount: document.getElementById("sensorCount"),
+  streamState: document.getElementById("streamState"),
+  liveEventsBody: document.getElementById("liveEventsBody"),
+  archiveBody: document.getElementById("archiveBody"),
+  systemLogs: document.getElementById("systemLogs"),
+  radarBlips: document.getElementById("radarBlips"),
+  analysisTitle: document.getElementById("analysisTitle"),
+  detailSensor: document.getElementById("detailSensor"),
+  detailLocation: document.getElementById("detailLocation"),
+  detailUtc: document.getElementById("detailUtc"),
+  detailFreq: document.getElementById("detailFreq"),
+  detailType: document.getElementById("detailType"),
+  detailReplica: document.getElementById("detailReplica"),
+  freqBadge: document.getElementById("freqBadge"),
+  timeChart: document.getElementById("timeChart"),
+  freqChart: document.getElementById("freqChart"),
+};
+
+const state = {
+  stream: null,
+  streamConnected: false,
+  liveEvents: [],
+  archiveEvents: [],
+  logs: [],
+  replicas: new Map(),
+  slotByReplica: new Map(),
+  sensorsFromEvents: new Set(),
+  knownSensors: 0,
+  selectedEventId: null,
+};
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function safeJson(raw) {
+  if (typeof raw !== "string" || raw.trim() === "") {
+    return null;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function shortId(value) {
+  if (typeof value !== "string" || value.length === 0) {
+    return "-";
+  }
+  const compact = value.replace(/^evt-/, "");
+  return `#${compact.slice(-6).toUpperCase()}`;
+}
+
+function toUtcTime(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "--:--:--";
+  }
+  return date.toISOString().slice(11, 19);
+}
+
+function toUtcDateTime(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "-";
+  }
+  return date.toISOString().replace("T", " ").replace("Z", " UTC");
+}
+
+function frequencyText(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) {
+    return "--";
+  }
+  return `${number.toFixed(2)} Hz`;
+}
+
+function classificationLabel(value) {
+  if (typeof value !== "string" || value.length === 0) {
+    return "UNKNOWN";
+  }
+  return value.replace(/_/g, "-").toUpperCase();
+}
+
+function classificationCss(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+  return `class-${value.toLowerCase()}`;
+}
+
+function severityFromClassification(value) {
+  if (value === "nuclear_like") {
+    return "fail";
+  }
+  if (value === "conventional_explosion") {
+    return "warn";
+  }
+  return "ok";
+}
+
+function firstDefined(values, fallback) {
+  for (const value of values) {
+    if (value !== undefined && value !== null) {
+      return value;
+    }
+  }
+  return fallback;
+}
+
+function applyDensityProfile() {
+  const h = window.innerHeight || 1080;
+  const w = window.innerWidth || 1920;
+
+  if (h < 680 || w < 980) {
+    MAX_LIVE_EVENTS = 6;
+    MAX_ARCHIVE_ROWS = 5;
+    MAX_LOG_ROWS = 8;
+  } else if (h < 820 || w < 1200) {
+    MAX_LIVE_EVENTS = 8;
+    MAX_ARCHIVE_ROWS = 6;
+    MAX_LOG_ROWS = 11;
+  } else if (h < 980) {
+    MAX_LIVE_EVENTS = 10;
+    MAX_ARCHIVE_ROWS = 7;
+    MAX_LOG_ROWS = 14;
+  } else {
+    MAX_LIVE_EVENTS = 12;
+    MAX_ARCHIVE_ROWS = 8;
+    MAX_LOG_ROWS = 18;
+  }
+
+  state.liveEvents = state.liveEvents.slice(0, MAX_LIVE_EVENTS);
+  state.archiveEvents = state.archiveEvents.slice(0, 80);
+  state.logs = state.logs.slice(0, MAX_LOG_ROWS);
+}
+
+function pushLog(message, level = "ok") {
+  const entry = {
+    timestamp: nowIso(),
+    message,
+    level,
+  };
+  state.logs.unshift(entry);
+  state.logs = state.logs.slice(0, MAX_LOG_ROWS);
+  renderLogs();
+}
+
+function assignReplicaSlot(replicaId) {
+  if (!replicaId) {
+    return null;
+  }
+  if (state.slotByReplica.has(replicaId)) {
+    return state.slotByReplica.get(replicaId);
+  }
+
+  const used = new Set(state.slotByReplica.values());
+  let slot = 1;
+  while (used.has(slot)) {
+    slot += 1;
+  }
+  state.slotByReplica.set(replicaId, slot);
+  return slot;
+}
+
+function replicaLabel(replicaId) {
+  if (!replicaId) {
+    return "-";
+  }
+  const slot = assignReplicaSlot(replicaId);
+  if (!slot) {
+    return replicaId.slice(0, 8);
+  }
+  return `R${slot}`;
+}
+
+function isLivenessSource(source) {
+  return source === "health" || source === "stream-open" || source === "stream-heartbeat" || source === "event-live";
+}
+
+function effectiveReplicaState(replica) {
+  if (!replica) {
+    return "unknown";
+  }
+  if (replica.status === "fail") {
+    return "fail";
+  }
+  if (replica.recoveringUntil && Date.now() < replica.recoveringUntil) {
+    return "recovering";
+  }
+  if (replica.status === "ok") {
+    return "ok";
+  }
+  return "unknown";
+}
+
+function registerReplica(replicaId, source) {
+  if (typeof replicaId !== "string" || replicaId.length === 0) {
+    return;
+  }
+
+  const liveSource = isLivenessSource(source);
+  const now = Date.now();
+  const slot = assignReplicaSlot(replicaId);
+  const existing = state.replicas.get(replicaId);
+
+  if (!existing) {
+    state.replicas.set(replicaId, {
+      id: replicaId,
+      slot,
+      status: liveSource ? "ok" : "unknown",
+      lastSeen: liveSource ? now : 0,
+      restarts: 0,
+      startedAt: null,
+      controlCommandsSeen: 0,
+      recoveringUntil: 0,
+    });
+    if (liveSource) {
+      pushLog(`SUBSCRIPTION ACTIVE (${replicaLabel(replicaId)})`, "ok");
+    }
+    return;
+  }
+
+  if (!liveSource) {
+    return;
+  }
+
+  const wasFail = existing.status === "fail";
+  const wasUnknown = existing.status === "unknown";
+  existing.lastSeen = now;
+  existing.status = "ok";
+  if (wasFail) {
+    existing.restarts += 1;
+    pushLog(`${replicaLabel(replicaId)} ONLINE (Replica restored)`, "ok");
+  } else if (wasUnknown) {
+    pushLog(`SUBSCRIPTION ACTIVE (${replicaLabel(replicaId)})`, "ok");
+  }
+}
+
+function registerReplicaFromHealth(payload) {
+  if (!payload || typeof payload.replica_id !== "string") {
+    return;
+  }
+
+  const replicaId = payload.replica_id;
+  const controlCommandsSeen = Number(payload.control_commands_seen);
+  const startedAt = typeof payload.started_at === "string" ? payload.started_at : null;
+
+  const existing = state.replicas.get(replicaId);
+  const previousCommands = existing && Number.isFinite(existing.controlCommandsSeen)
+    ? existing.controlCommandsSeen
+    : null;
+  const previousStartedAt = existing && typeof existing.startedAt === "string"
+    ? existing.startedAt
+    : null;
+
+  registerReplica(replicaId, "health");
+  const updated = state.replicas.get(replicaId);
+  if (!updated) {
+    return;
+  }
+
+  if (Number.isFinite(controlCommandsSeen)) {
+    if (previousCommands !== null && controlCommandsSeen > previousCommands) {
+      pushLog(`SHUTDOWN CMD RECEIVED (${replicaLabel(replicaId)})`, "fail");
+    }
+    updated.controlCommandsSeen = controlCommandsSeen;
+  }
+
+  if (startedAt) {
+    if (previousStartedAt && previousStartedAt !== startedAt) {
+      updated.restarts += 1;
+      pushLog(`${replicaLabel(replicaId)} RESTARTED (new process)`, "warn");
+      updated.recoveringUntil = Date.now() + REPLICA_RECOVERY_MS;
+      updated.status = "ok";
+      updated.lastSeen = Date.now();
+    }
+    updated.startedAt = startedAt;
+  }
+}
+
+function markStaleReplicas() {
+  const now = Date.now();
+  for (const replica of state.replicas.values()) {
+    if (replica.status === "ok" && now - replica.lastSeen > REPLICA_STALE_MS) {
+      replica.status = "fail";
+      replica.recoveringUntil = 0;
+      pushLog(`${replicaLabel(replica.id)} OFFLINE (No heartbeat)`, "fail");
+    }
+  }
+}
+
+function normalizeEvent(raw) {
+  if (!raw || typeof raw !== "object") {
+    return null;
+  }
+
+  const eventId = raw.event_id || raw.eventId || raw.id;
+  const sensorId = raw.sensor_id || raw.sensorId || "unknown";
+  const classification = (
+    raw.classification ||
+    raw.eventType ||
+    "unknown"
+  ).toString().toLowerCase();
+  const dominantFrequency = Number(
+    firstDefined(
+      [raw.dominant_frequency_hz, raw.dominantFrequencyHz, raw.frequencyHz],
+      NaN
+    )
+  );
+  const timestamp = raw.timestamp || raw.startsAt || nowIso();
+  const detectedBy = raw.detected_by || raw.detectedBy || raw.replica_id || null;
+  const region = typeof raw.region === "string" ? raw.region : null;
+  const coordinates = raw.coordinates && typeof raw.coordinates === "object"
+    ? {
+        lat: firstDefined([raw.coordinates.lat], null),
+        lon: firstDefined([raw.coordinates.lon], null),
+      }
+    : { lat: null, lon: null };
+
+  if (typeof eventId !== "string" || eventId.length === 0) {
+    return null;
+  }
+
+  return {
+    event_id: eventId,
+    sensor_id: String(sensorId),
+    classification,
+    dominant_frequency_hz: Number.isFinite(dominantFrequency) ? dominantFrequency : null,
+    timestamp,
+    detected_by: detectedBy ? String(detectedBy) : null,
+    region,
+    coordinates,
+  };
+}
+
+function mergeLiveEvent(incoming, source = "event-live") {
+  if (!incoming) {
+    return;
+  }
+
+  if (incoming.sensor_id) {
+    state.sensorsFromEvents.add(incoming.sensor_id);
+  }
+  if (incoming.detected_by) {
+    registerReplica(incoming.detected_by, source);
+  }
+
+  const existing = state.liveEvents.find((item) => item.event_id === incoming.event_id);
+  if (existing) {
+    if (incoming.detected_by) {
+      existing.replicas.add(incoming.detected_by);
+    }
+    if (new Date(incoming.timestamp).getTime() > new Date(existing.timestamp).getTime()) {
+      existing.timestamp = incoming.timestamp;
+      existing.sensor_id = incoming.sensor_id;
+      existing.classification = incoming.classification;
+      existing.dominant_frequency_hz = incoming.dominant_frequency_hz;
+      existing.region = incoming.region;
+      existing.coordinates = incoming.coordinates;
+    }
+  } else {
+    const item = {
+      ...incoming,
+      replicas: new Set(incoming.detected_by ? [incoming.detected_by] : []),
+    };
+    state.liveEvents.unshift(item);
+  }
+
+  state.liveEvents.sort(
+    (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+  );
+  state.liveEvents = state.liveEvents.slice(0, MAX_LIVE_EVENTS);
+
+  if (!state.selectedEventId) {
+    state.selectedEventId = incoming.event_id;
+  }
+}
+
+function updateArchiveEvents(events) {
+  state.archiveEvents = events.map(normalizeEvent).filter(Boolean);
+  state.archiveEvents.sort(
+    (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+  );
+
+  for (const event of state.archiveEvents) {
+    if (event.detected_by) {
+      registerReplica(event.detected_by, "archive");
+    }
+    if (event.sensor_id) {
+      state.sensorsFromEvents.add(event.sensor_id);
+    }
+  }
+
+  if (!state.selectedEventId && state.archiveEvents.length > 0) {
+    state.selectedEventId = state.archiveEvents[0].event_id;
+  }
+}
+
+async function loadArchiveEvents() {
+  try {
+    const response = await fetch("/api/events?limit=80", { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error(`archive fetch failed (${response.status})`);
+    }
+    const payload = await response.json();
+    const items = Array.isArray(payload.items) ? payload.items : [];
+    updateArchiveEvents(items);
+
+    if (state.liveEvents.length === 0) {
+      for (const event of state.archiveEvents.slice(0, 10)) {
+        mergeLiveEvent(event, "event-history");
+      }
+    }
+    renderAll();
+  } catch (error) {
+    pushLog(`ARCHIVE UNAVAILABLE (${error.message})`, "warn");
+  }
+}
+
+async function pollHealth() {
+  try {
+    const response = await fetch("/health", { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error(`health status ${response.status}`);
+    }
+
+    const payload = await response.json();
+    registerReplicaFromHealth(payload);
+    if (payload && Number.isFinite(payload.known_sensors)) {
+      state.knownSensors = payload.known_sensors;
+    }
+    markStaleReplicas();
+    renderStatus();
+  } catch (error) {
+    markStaleReplicas();
+    renderStatus();
+    pushLog(`HEALTH CHECK FAILED (${error.message})`, "warn");
+  }
+}
+
+function connectEventStream() {
+  if (state.stream) {
+    state.stream.close();
+  }
+
+  const stream = new EventSource("/api/events/stream");
+  state.stream = stream;
+
+  stream.onopen = () => {
+    state.streamConnected = true;
+    dom.streamState.textContent = "STREAM: LIVE";
+    dom.streamState.className = "stream-state ok";
+    pushLog("EVENT STREAM CONNECTED", "ok");
+  };
+
+  stream.addEventListener("open", (event) => {
+    const payload = safeJson(event.data);
+    if (payload && typeof payload.replica_id === "string") {
+      registerReplica(payload.replica_id, "stream-open");
+      renderStatus();
+    }
+  });
+
+  stream.addEventListener("heartbeat", (event) => {
+    const payload = safeJson(event.data);
+    if (payload && typeof payload.replica_id === "string") {
+      registerReplica(payload.replica_id, "stream-heartbeat");
+      renderStatus();
+    }
+  });
+
+  stream.addEventListener("event", (event) => {
+    const payload = safeJson(event.data);
+    const normalized = normalizeEvent(payload);
+    if (!normalized) {
+      return;
+    }
+
+    mergeLiveEvent(normalized);
+    if (state.archiveEvents.every((row) => row.event_id !== normalized.event_id)) {
+      state.archiveEvents.unshift(normalized);
+      state.archiveEvents = state.archiveEvents.slice(0, 80);
+    }
+
+    pushLog(
+      `EVENT ${shortId(normalized.event_id)} ${classificationLabel(normalized.classification)} (${normalized.sensor_id})`,
+      severityFromClassification(normalized.classification)
+    );
+    renderAll();
+  });
+
+  stream.onerror = () => {
+    if (state.streamConnected) {
+      pushLog("EVENT STREAM LOST, RETRYING", "warn");
+    }
+    state.streamConnected = false;
+    dom.streamState.textContent = "STREAM: RECONNECTING";
+    dom.streamState.className = "stream-state warn";
+    stream.close();
+    setTimeout(connectEventStream, 2500);
+  };
+}
+
+function getSelectedEvent() {
+  if (!state.selectedEventId) {
+    return null;
+  }
+  return (
+    state.liveEvents.find((event) => event.event_id === state.selectedEventId) ||
+    state.archiveEvents.find((event) => event.event_id === state.selectedEventId) ||
+    null
+  );
+}
+
+function statusFromReplicaState() {
+  const entries = [...state.replicas.values()];
+  if (entries.length === 0) {
+    return { label: "DEGRADED", css: "warn" };
+  }
+
+  const healthy = entries.filter((item) => effectiveReplicaState(item) === "ok").length;
+  const failed = entries.filter((item) => effectiveReplicaState(item) === "fail").length;
+  const recovering = entries.filter((item) => effectiveReplicaState(item) === "recovering").length;
+  const unknown = entries.filter((item) => effectiveReplicaState(item) === "unknown").length;
+
+  if (healthy === 0 && recovering === 0 && failed > 0 && unknown === 0) {
+    return { label: "FAIL", css: "fail" };
+  }
+  if (failed > 0 || recovering > 0 || unknown > 0) {
+    return { label: "DEGRADED", css: "warn" };
+  }
+  if (healthy < EXPECTED_REPLICAS) {
+    return { label: "DEGRADED", css: "warn" };
+  }
+  return { label: "OPERATIONAL", css: "ok" };
+}
+
+function renderStatus() {
+  const status = statusFromReplicaState();
+  dom.systemStatus.textContent = status.label;
+  dom.systemStatus.className = `v ${status.css}`;
+
+  const slotsCount = Math.max(
+    EXPECTED_REPLICAS,
+    ...[...state.slotByReplica.values(), EXPECTED_REPLICAS]
+  );
+  const bySlot = new Map();
+  for (const replica of state.replicas.values()) {
+    bySlot.set(replica.slot, replica);
+  }
+
+  const parts = [];
+  for (let slot = 1; slot <= slotsCount; slot += 1) {
+    const replica = bySlot.get(slot);
+    let label = `P${slot}: N/A`;
+    let css = "warn";
+    if (replica) {
+      const effective = effectiveReplicaState(replica);
+      if (effective === "ok") {
+        label = `P${slot}: OK`;
+        css = "ok";
+      } else if (effective === "fail") {
+        label = `P${slot}: FAIL`;
+        css = "fail";
+      } else if (effective === "recovering") {
+        label = `P${slot}: REC`;
+        css = "warn";
+      } else {
+        label = `P${slot}: N/A`;
+        css = "warn";
+      }
+    }
+    parts.push(`<span class="replica-pill ${css}">${label}</span>`);
+  }
+  dom.replicaStrip.className = "replica-strip";
+  dom.replicaStrip.innerHTML = parts.join("");
+
+  const sensorCount = state.knownSensors || state.sensorsFromEvents.size || 0;
+  dom.sensorCount.textContent = `${sensorCount} ACTIVE`;
+}
+
+function renderLiveTable() {
+  const rows = state.liveEvents
+    .map((event) => {
+      const replicas = event.replicas
+        ? [...event.replicas].map((id) => replicaLabel(id)).join(", ")
+        : event.detected_by
+          ? replicaLabel(event.detected_by)
+          : "-";
+      const selectedClass = event.event_id === state.selectedEventId ? "selected" : "";
+      return `
+        <tr data-event-id="${event.event_id}" class="${selectedClass}">
+          <td>${shortId(event.event_id)}</td>
+          <td>${toUtcTime(event.timestamp)}</td>
+          <td>${event.sensor_id}</td>
+          <td class="${classificationCss(event.classification)}">${classificationLabel(event.classification)}</td>
+          <td>${frequencyText(event.dominant_frequency_hz)}</td>
+          <td>${replicas || "-"}</td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  dom.liveEventsBody.innerHTML = rows || `
+    <tr>
+      <td colspan="6">No live events yet. Waiting for stream...</td>
+    </tr>
+  `;
+
+  for (const row of dom.liveEventsBody.querySelectorAll("tr[data-event-id]")) {
+    row.addEventListener("click", () => {
+      state.selectedEventId = row.dataset.eventId;
+      renderAll();
+    });
+  }
+}
+
+function renderArchiveTable() {
+  const rows = state.archiveEvents
+    .slice(0, MAX_ARCHIVE_ROWS)
+    .map((event) => `
+      <tr>
+        <td>${toUtcTime(event.timestamp)}</td>
+        <td>${shortId(event.event_id)}</td>
+        <td class="${classificationCss(event.classification)}">${classificationLabel(event.classification)}</td>
+        <td>${event.detected_by ? `${replicaLabel(event.detected_by)} PERSISTED` : "PERSISTED"}</td>
+      </tr>
+    `)
+    .join("");
+
+  dom.archiveBody.innerHTML = rows || `
+    <tr>
+      <td colspan="4">No historical events stored yet.</td>
+    </tr>
+  `;
+}
+
+function renderLogs() {
+  dom.systemLogs.innerHTML = state.logs
+    .map((entry) => `
+      <li class="log-item ${entry.level}">
+        ${toUtcTime(entry.timestamp)} - ${entry.message}
+      </li>
+    `)
+    .join("");
+}
+
+function deterministicSeed(value) {
+  let hash = 0;
+  const text = String(value || "seed");
+  for (let i = 0; i < text.length; i += 1) {
+    hash = (hash * 31 + text.charCodeAt(i)) >>> 0;
+  }
+  return hash;
+}
+
+function prepareCanvas(canvas) {
+  const ratio = window.devicePixelRatio || 1;
+  const width = Math.max(320, Math.floor(canvas.clientWidth * ratio));
+  const height = Math.max(180, Math.floor(canvas.clientHeight * ratio));
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+  const context = canvas.getContext("2d");
+  context.setTransform(1, 0, 0, 1, 0, 0);
+  return { context, width, height, ratio };
+}
+
+function drawGrid(context, width, height, verticalLines, horizontalLines) {
+  context.strokeStyle = "rgba(132, 162, 132, 0.25)";
+  context.lineWidth = 1;
+  for (let i = 0; i <= verticalLines; i += 1) {
+    const x = (width * i) / verticalLines;
+    context.beginPath();
+    context.moveTo(x, 0);
+    context.lineTo(x, height);
+    context.stroke();
+  }
+  for (let j = 0; j <= horizontalLines; j += 1) {
+    const y = (height * j) / horizontalLines;
+    context.beginPath();
+    context.moveTo(0, y);
+    context.lineTo(width, y);
+    context.stroke();
+  }
+}
+
+function drawTimeDomain(event) {
+  const { context, width, height } = prepareCanvas(dom.timeChart);
+  context.clearRect(0, 0, width, height);
+  drawGrid(context, width, height, 10, 6);
+
+  if (!event) {
+    context.fillStyle = "rgba(214, 235, 215, 0.7)";
+    context.font = "24px Share Tech Mono";
+    context.fillText("Waiting for event selection...", 24, 38);
+    return;
+  }
+
+  const freq = Number(event.dominant_frequency_hz) || 1.5;
+  const seed = deterministicSeed(event.event_id);
+  context.strokeStyle = "#b7f277";
+  context.lineWidth = 2.2;
+  context.beginPath();
+
+  const samples = 320;
+  for (let i = 0; i < samples; i += 1) {
+    const x = (i / (samples - 1)) * width;
+    const carrier = Math.sin((i / samples) * Math.PI * 2 * (freq * 2.1));
+    const envelope = 0.64 + 0.35 * Math.sin((i + seed % 50) / 42);
+    const noise = Math.sin((i + seed) * 0.37) * 0.06;
+    const value = (carrier * envelope + noise) * 0.34;
+    const y = height * 0.5 - value * height * 0.8;
+
+    if (i === 0) {
+      context.moveTo(x, y);
+    } else {
+      context.lineTo(x, y);
+    }
+  }
+  context.stroke();
+}
+
+function drawFrequencyDomain(event) {
+  const { context, width, height } = prepareCanvas(dom.freqChart);
+  context.clearRect(0, 0, width, height);
+
+  const zoneA = width * (2.5 / 30);
+  const zoneB = width * (8.0 / 30);
+  context.fillStyle = "rgba(141, 227, 117, 0.12)";
+  context.fillRect(0, 0, zoneA, height);
+  context.fillStyle = "rgba(238, 211, 108, 0.13)";
+  context.fillRect(zoneA, 0, zoneB - zoneA, height);
+  context.fillStyle = "rgba(255, 108, 108, 0.12)";
+  context.fillRect(zoneB, 0, width - zoneB, height);
+
+  drawGrid(context, width, height, 8, 5);
+
+  if (!event) {
+    context.fillStyle = "rgba(214, 235, 215, 0.7)";
+    context.font = "24px Share Tech Mono";
+    context.fillText("No spectrum available", 24, 38);
+    dom.freqBadge.textContent = "DOMINANT FREQUENCY: --";
+    return;
+  }
+
+  const freq = Number(event.dominant_frequency_hz) || 1.0;
+  const sigma = Math.max(0.9, Math.min(2.7, freq / 3));
+
+  context.strokeStyle = "#9df85f";
+  context.lineWidth = 3;
+  context.beginPath();
+  const points = 90;
+  for (let i = 0; i < points; i += 1) {
+    const hz = 0.5 + (i / (points - 1)) * 29.5;
+    const x = (i / (points - 1)) * width;
+    const peak = Math.exp(-((hz - freq) ** 2) / (2 * sigma ** 2));
+    const harmonics = Math.exp(-((hz - freq * 1.85) ** 2) / (2 * (sigma * 1.35) ** 2)) * 0.22;
+    const baseline = 0.035 + 0.02 * Math.sin(i * 0.42);
+    const amplitude = Math.min(1, baseline + peak * 0.92 + harmonics);
+    const y = height - amplitude * (height * 0.9) - 8;
+    if (i === 0) {
+      context.moveTo(x, y);
+    } else {
+      context.lineTo(x, y);
+    }
+  }
+  context.stroke();
+
+  dom.freqBadge.textContent = `DOMINANT FREQUENCY: ${freq.toFixed(2)} Hz`;
+}
+
+function renderAnalysis() {
+  const event = getSelectedEvent();
+  if (!event) {
+    dom.analysisTitle.textContent = "NO EVENT SELECTED";
+    dom.detailSensor.textContent = "-";
+    dom.detailLocation.textContent = "-";
+    dom.detailUtc.textContent = "-";
+    dom.detailFreq.textContent = "-";
+    dom.detailType.textContent = "-";
+    dom.detailReplica.textContent = "-";
+    drawTimeDomain(null);
+    drawFrequencyDomain(null);
+    return;
+  }
+
+  dom.analysisTitle.textContent = `ID ${shortId(event.event_id)}`;
+  dom.detailSensor.textContent = event.sensor_id;
+  dom.detailLocation.textContent =
+    event.region ||
+    (event.coordinates && (event.coordinates.lat || event.coordinates.lon)
+      ? `${firstDefined([event.coordinates.lat], "-")}, ${firstDefined([event.coordinates.lon], "-")}`
+      : "Unknown");
+  dom.detailUtc.textContent = toUtcDateTime(event.timestamp);
+  dom.detailFreq.textContent = frequencyText(event.dominant_frequency_hz);
+  dom.detailType.textContent = classificationLabel(event.classification);
+  dom.detailType.className = classificationCss(event.classification);
+  dom.detailReplica.textContent = event.detected_by ? replicaLabel(event.detected_by) : "-";
+
+  drawTimeDomain(event);
+  drawFrequencyDomain(event);
+}
+
+function renderRadar() {
+  const points = state.liveEvents.slice(0, 10).map((event) => {
+    const seed = deterministicSeed(event.event_id);
+    const angle = ((seed % 360) * Math.PI) / 180;
+    const radius = 18 + (seed % 68);
+    const x = 50 + Math.cos(angle) * (radius * 0.42);
+    const y = 50 + Math.sin(angle) * (radius * 0.42);
+    const css = severityFromClassification(event.classification);
+    const color = css === "fail" ? "#ff6961" : css === "warn" ? "#f0d264" : "#8adf62";
+    return `
+      <span class="blip ${css}" style="left:${x.toFixed(2)}%;top:${y.toFixed(2)}%;background:${color};box-shadow:0 0 11px ${color};animation-delay:${(seed % 12) / 10}s"></span>
+    `;
+  });
+
+  dom.radarBlips.innerHTML = points.join("");
+}
+
+function renderClock() {
+  dom.utcNow.textContent = `UTC: ${new Date().toISOString().slice(11, 19)}`;
+}
+
+function renderAll() {
+  renderStatus();
+  renderLiveTable();
+  renderArchiveTable();
+  renderRadar();
+  renderAnalysis();
+}
+
+function initResizeHandler() {
+  let timeout = null;
+  window.addEventListener("resize", () => {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+    timeout = setTimeout(() => {
+      applyDensityProfile();
+      renderAll();
+    }, 140);
+  });
+}
+
+async function boot() {
+  applyDensityProfile();
+  renderClock();
+  setInterval(renderClock, 1000);
+  initResizeHandler();
+
+  pushLog("DASHBOARD INITIALIZED", "ok");
+  await loadArchiveEvents();
+  connectEventStream();
+  await pollHealth();
+
+  setInterval(pollHealth, HEALTH_POLL_MS);
+  setInterval(loadArchiveEvents, ARCHIVE_POLL_MS);
+  setInterval(() => {
+    markStaleReplicas();
+    renderStatus();
+  }, 2500);
+}
+
+boot();

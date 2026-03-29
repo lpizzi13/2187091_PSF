@@ -3,6 +3,7 @@ services:
   simulator:
     image: seismic-signal-simulator:multiarch_v1
     container_name: seismic-simulator
+    restart: unless-stopped
     ports:
       - "8080:8080"
     environment:
@@ -13,7 +14,7 @@ services:
     networks:
       - seismic-net
 
-  # 2. Database condiviso (PostgreSQL)
+  # 2. Database condiviso (MySQL)
   db:
     image: mysql:8.0
     container_name: seismic-db
@@ -25,6 +26,12 @@ services:
       - MYSQL_ROOT_PASSWORD=root_secret
     volumes:
       - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
     networks:
       - seismic-net
 
@@ -32,25 +39,49 @@ services:
   broker:
     build: ./broker
     container_name: seismic-broker
+    restart: unless-stopped
     depends_on:
-      - simulator
+      simulator:
+        condition: service_started
     environment:
       - SIMULATOR_URL=http://simulator:8080
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2).read()\" >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
     networks:
       - seismic-net
 
   # 4. Processing Service (Replicato)
   replica:
     build: ./processing-replica
+    restart: unless-stopped
     deploy:
       replicas: 3
     depends_on:
-      - db
-      - broker
+      db:
+        condition: service_healthy
+      broker:
+        condition: service_healthy
+      simulator:
+        condition: service_started
     environment:
-      - DB_URL=postgresql://admin:secret@db:5432/seismic_db
+      - DB_URL=mysql://admin:secret@db:3306/seismic_db
+      - SIMULATOR_API_URL=http://simulator:8080
       - SIMULATOR_CONTROL_URL=http://simulator:8080/api/control
       - BROKER_URL=ws://broker:8000/data
+      - SAMPLING_RATE_HZ=20.0
+      - WINDOW_SIZE=128
+      - MIN_EVENT_GAP_SECONDS=4.0
+      - PORT=8000
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2).read()\" >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
     networks:
       - seismic-net
 
@@ -58,10 +89,18 @@ services:
   gateway:
     build: ./gateway
     container_name: seismic-gateway
+    restart: unless-stopped
     ports:
       - "80:80"
     depends_on:
-      - replica
+      replica:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost/gateway/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
     networks:
       - seismic-net
 
@@ -69,10 +108,18 @@ services:
   dashboard:
     build: ./dashboard
     container_name: seismic-dashboard
+    restart: unless-stopped
     ports:
       - "3000:3000"
     depends_on:
-      - gateway
+      gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3000/ >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
     networks:
       - seismic-net
 

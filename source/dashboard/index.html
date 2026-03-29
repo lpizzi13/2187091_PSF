@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Seismic Command Center</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="panel top-status">
+      <div class="status-left">
+        <span class="kv"><span class="k">SYSTEM:</span> <span id="systemStatus" class="v ok">OPERATIONAL</span></span>
+        <span class="divider">|</span>
+        <span class="kv"><span class="k">REPLICAS:</span> <span id="replicaStrip"></span></span>
+        <span class="divider">|</span>
+        <span class="kv"><span class="k">SENSORS:</span> <span id="sensorCount" class="v">0 ACTIVE</span></span>
+      </div>
+      <div class="status-right">
+        <span id="streamState" class="stream-state">STREAM: CONNECTING</span>
+        <span class="divider">|</span>
+        <span id="utcNow">UTC: --:--:--</span>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="panel radar-panel">
+        <h2>TACTICAL RADAR</h2>
+        <div class="radar-frame">
+          <div class="radar-grid">
+            <div class="radar-sweep"></div>
+            <div id="radarBlips" class="radar-blips"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel feed-panel">
+        <h2>LIVE EVENTS FEED</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>TIMESTAMP (UTC)</th>
+                <th>SENSOR</th>
+                <th>TYPE</th>
+                <th>FREQ (Hz)</th>
+                <th>REPLICAS</th>
+              </tr>
+            </thead>
+            <tbody id="liveEventsBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel analysis-panel">
+        <h2>EVENT ANALYSIS - <span id="analysisTitle">NO EVENT SELECTED</span></h2>
+        <div class="analysis-grid">
+          <article class="event-details panel-soft">
+            <h3>EVENT DETAILS</h3>
+            <dl>
+              <dt>Sensor</dt><dd id="detailSensor">-</dd>
+              <dt>Location</dt><dd id="detailLocation">-</dd>
+              <dt>UTC</dt><dd id="detailUtc">-</dd>
+              <dt>Dominant f</dt><dd id="detailFreq">-</dd>
+              <dt>Type</dt><dd id="detailType">-</dd>
+              <dt>By Replica</dt><dd id="detailReplica">-</dd>
+            </dl>
+          </article>
+
+          <article class="chart-card panel-soft">
+            <h3>TIME DOMAIN (Raw Data)</h3>
+            <canvas id="timeChart" width="700" height="260"></canvas>
+          </article>
+
+          <article class="chart-card panel-soft">
+            <h3>FREQUENCY DOMAIN (Spectrum Analysis)</h3>
+            <canvas id="freqChart" width="700" height="260"></canvas>
+            <div id="freqBadge" class="freq-badge">DOMINANT FREQUENCY: --</div>
+          </article>
+        </div>
+      </section>
+
+      <section class="panel logs-panel">
+        <h2>SYSTEM LOGS &amp; FAULT TOLERANCE</h2>
+        <ul id="systemLogs" class="log-list"></ul>
+      </section>
+
+      <section class="panel archive-panel">
+        <h2>REPLICA ARCHIVE</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>TIMESTAMP</th>
+                <th>EVENT ID</th>
+                <th>CLASSIFICATION</th>
+                <th>STATUS</th>
+              </tr>
+            </thead>
+            <tbody id="archiveBody"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
