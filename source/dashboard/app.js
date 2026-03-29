@@ -7,6 +7,44 @@ let MAX_LIVE_EVENTS = 12;
 let MAX_ARCHIVE_ROWS = 8;
 let MAX_LOG_ROWS = 16;
 
+// Imposta a true solo durante il posizionamento manuale dei sensori sulla mappa.
+// Quando hai finito di piazzarli, metti false per mostrare i puntini solo su evento reale.
+const SHOW_ALL_SENSORS_ON_MAP = true;
+
+// Coordinate manuali in percentuale rispetto alla mappa world.avif.
+const SENSOR_MARKERS = [
+  { sensorId: "sensor-01", xPct: 43.23, yPct: 29.85 },
+  { sensorId: "sensor-02", xPct: 45.48, yPct: 52.33 },
+  { sensorId: "sensor-03", xPct: 58.96, yPct: 45.9 },
+  { sensorId: "sensor-04", xPct: 54.91, yPct: 66.78 },
+  { sensorId: "sensor-05", xPct: 53.29, yPct: 48.03 },
+  { sensorId: "sensor-06", xPct: 48.74, yPct: 31.3 },
+  { sensorId: "sensor-07", xPct: 34.48, yPct: 76.59 },
+  { sensorId: "sensor-08", xPct: 49.06, yPct: 45.06 },
+];
+
+const SENSOR_MARKERS_STORAGE_KEY = "dashboard.sensorMarkers.override.v2";
+const MAP_EDITOR_QUERY_PARAM = "editSensors";
+
+const SENSOR_TOOLTIP_LABELS = {
+  "sensor-01": "sensor-01",
+  "sensor-02": "sensor-02",
+  "sensor-03": "sensor-03",
+  "sensor-04": "sensor-04",
+  "sensor-05": "sensor-05",
+  "sensor-06": "sensor-06",
+  "sensor-07": "sensor-07",
+  "sensor-08": "Datacenter Hub (08-12)",
+};
+
+const SENSOR_MAP_GROUP = {
+  "sensor-08": "sensor-08",
+  "sensor-09": "sensor-08",
+  "sensor-10": "sensor-08",
+  "sensor-11": "sensor-08",
+  "sensor-12": "sensor-08",
+};
+
 const dom = {
   utcNow: document.getElementById("utcNow"),
   systemStatus: document.getElementById("systemStatus"),
@@ -16,7 +54,7 @@ const dom = {
   liveEventsBody: document.getElementById("liveEventsBody"),
   archiveBody: document.getElementById("archiveBody"),
   systemLogs: document.getElementById("systemLogs"),
-  radarBlips: document.getElementById("radarBlips"),
+  sensorBlips: document.getElementById("sensorBlips"),
   analysisTitle: document.getElementById("analysisTitle"),
   detailSensor: document.getElementById("detailSensor"),
   detailLocation: document.getElementById("detailLocation"),
@@ -38,6 +76,11 @@ const state = {
   replicas: new Map(),
   slotByReplica: new Map(),
   sensorsFromEvents: new Set(),
+  streamEventIds: new Set(),
+  latestStreamEventBySensor: new Map(),
+  markerOverrides: new Map(),
+  mapEditMode: false,
+  activeMarkerDrag: null,
   knownSensors: 0,
   selectedEventId: null,
 };
@@ -104,11 +147,15 @@ function classificationCss(value) {
 }
 
 function severityFromClassification(value) {
-  if (value === "nuclear_like") {
+  const normalized = typeof value === "string" ? value.toLowerCase() : "";
+  if (normalized === "nuclear_like" || normalized === "atomic_like" || normalized === "atomic-like") {
     return "fail";
   }
-  if (value === "conventional_explosion") {
+  if (normalized === "conventional_explosion" || normalized === "bomba" || normalized === "bomb") {
     return "warn";
+  }
+  if (normalized === "earthquake") {
+    return "ok";
   }
   return "ok";
 }
@@ -355,6 +402,11 @@ function mergeLiveEvent(incoming, source = "event-live") {
 
   if (incoming.sensor_id) {
     state.sensorsFromEvents.add(incoming.sensor_id);
+    if (source === "event-live") {
+      const markerSensorId = markerSensorIdForMap(incoming.sensor_id);
+      state.streamEventIds.add(incoming.event_id);
+      state.latestStreamEventBySensor.set(markerSensorId, incoming);
+    }
   }
   if (incoming.detected_by) {
     registerReplica(incoming.detected_by, source);
@@ -385,6 +437,18 @@ function mergeLiveEvent(incoming, source = "event-live") {
     (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
   );
   state.liveEvents = state.liveEvents.slice(0, MAX_LIVE_EVENTS);
+
+  const liveIds = new Set(state.liveEvents.map((item) => item.event_id));
+  for (const eventId of state.streamEventIds) {
+    if (!liveIds.has(eventId)) {
+      state.streamEventIds.delete(eventId);
+    }
+  }
+  for (const [sensorId, event] of state.latestStreamEventBySensor.entries()) {
+    if (!event || !liveIds.has(event.event_id)) {
+      state.latestStreamEventBySensor.delete(sensorId);
+    }
+  }
 
   if (!state.selectedEventId) {
     state.selectedEventId = incoming.event_id;
@@ -669,6 +733,253 @@ function deterministicSeed(value) {
   return hash;
 }
 
+function clampPct(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    return 50;
+  }
+  return Math.min(99.8, Math.max(0.2, parsed));
+}
+
+function mapDotClass(event) {
+  if (!event) {
+    return "idle";
+  }
+  return severityFromClassification(event.classification);
+}
+
+function markerSensorIdForMap(sensorId) {
+  if (typeof sensorId !== "string" || sensorId.length === 0) {
+    return sensorId;
+  }
+  return SENSOR_MAP_GROUP[sensorId] || sensorId;
+}
+
+function markerTooltipLabel(sensorId) {
+  if (typeof sensorId !== "string" || sensorId.length === 0) {
+    return "Unknown sensor";
+  }
+  return SENSOR_TOOLTIP_LABELS[sensorId] || sensorId;
+}
+
+function loadMarkerOverrides() {
+  try {
+    const raw = window.localStorage.getItem(SENSOR_MARKERS_STORAGE_KEY);
+    if (!raw) {
+      return new Map();
+    }
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      return new Map();
+    }
+
+    const overrides = new Map();
+    for (const entry of parsed) {
+      if (!entry || typeof entry !== "object" || typeof entry.sensorId !== "string") {
+        continue;
+      }
+      overrides.set(entry.sensorId, {
+        sensorId: entry.sensorId,
+        xPct: clampPct(entry.xPct),
+        yPct: clampPct(entry.yPct),
+      });
+    }
+    return overrides;
+  } catch {
+    return new Map();
+  }
+}
+
+function persistMarkerOverrides() {
+  try {
+    const payload = [...state.markerOverrides.values()].map((entry) => ({
+      sensorId: entry.sensorId,
+      xPct: Number(clampPct(entry.xPct).toFixed(2)),
+      yPct: Number(clampPct(entry.yPct).toFixed(2)),
+    }));
+    window.localStorage.setItem(SENSOR_MARKERS_STORAGE_KEY, JSON.stringify(payload));
+  } catch {
+    // Ignore storage failures (private mode or blocked storage).
+  }
+}
+
+function getMergedSensorMarkers() {
+  const merged = new Map();
+
+  for (const marker of SENSOR_MARKERS) {
+    if (!marker || typeof marker.sensorId !== "string") {
+      continue;
+    }
+    merged.set(marker.sensorId, {
+      sensorId: marker.sensorId,
+      xPct: clampPct(marker.xPct),
+      yPct: clampPct(marker.yPct),
+    });
+  }
+
+  for (const [sensorId, override] of state.markerOverrides.entries()) {
+    if (!merged.has(sensorId)) {
+      continue;
+    }
+    merged.set(sensorId, {
+      sensorId,
+      xPct: clampPct(override.xPct),
+      yPct: clampPct(override.yPct),
+    });
+  }
+
+  return [...merged.values()];
+}
+
+function setMarkerPosition(sensorId, xPct, yPct, options = {}) {
+  if (typeof sensorId !== "string" || sensorId.length === 0) {
+    return;
+  }
+  const persist = options.persist !== false;
+  state.markerOverrides.set(sensorId, {
+    sensorId,
+    xPct: clampPct(xPct),
+    yPct: clampPct(yPct),
+  });
+  if (persist) {
+    persistMarkerOverrides();
+  }
+}
+
+function exportCurrentMarkers() {
+  const markers = getMergedSensorMarkers().map((entry) => ({
+    sensorId: entry.sensorId,
+    xPct: Number(entry.xPct.toFixed(2)),
+    yPct: Number(entry.yPct.toFixed(2)),
+  }));
+  console.log(JSON.stringify(markers, null, 2));
+  return markers;
+}
+
+function resetMarkerOverrides() {
+  state.markerOverrides.clear();
+  try {
+    window.localStorage.removeItem(SENSOR_MARKERS_STORAGE_KEY);
+  } catch {
+    // Ignore storage failures.
+  }
+  renderSensorMap();
+  pushLog("MAP MARKERS RESET TO CODE DEFAULTS", "warn");
+}
+
+function updateDraggedMarkerFromPointer(event) {
+  if (!state.activeMarkerDrag || !dom.sensorBlips) {
+    return;
+  }
+
+  const bounds = dom.sensorBlips.getBoundingClientRect();
+  if (bounds.width <= 0 || bounds.height <= 0) {
+    return;
+  }
+
+  const xPct = ((event.clientX - bounds.left) / bounds.width) * 100;
+  const yPct = ((event.clientY - bounds.top) / bounds.height) * 100;
+  const x = clampPct(xPct);
+  const y = clampPct(yPct);
+
+  setMarkerPosition(state.activeMarkerDrag.sensorId, x, y, { persist: false });
+
+  if (state.activeMarkerDrag.element) {
+    state.activeMarkerDrag.element.style.left = `${x.toFixed(2)}%`;
+    state.activeMarkerDrag.element.style.top = `${y.toFixed(2)}%`;
+    state.activeMarkerDrag.element.title = `${markerTooltipLabel(state.activeMarkerDrag.sensorId)} (${x.toFixed(2)}%, ${y.toFixed(2)}%)`;
+  }
+}
+
+function onSensorMapPointerDown(event) {
+  if (!state.mapEditMode) {
+    return;
+  }
+  const target = event.target instanceof Element
+    ? event.target.closest(".sensor-dot[data-sensor-id]")
+    : null;
+  if (!target) {
+    return;
+  }
+
+  const sensorId = target.dataset.sensorId;
+  if (!sensorId) {
+    return;
+  }
+
+  state.activeMarkerDrag = {
+    sensorId,
+    pointerId: event.pointerId,
+    element: target,
+  };
+  target.classList.add("dragging");
+  if (typeof target.setPointerCapture === "function") {
+    target.setPointerCapture(event.pointerId);
+  }
+  updateDraggedMarkerFromPointer(event);
+  event.preventDefault();
+}
+
+function onSensorMapPointerMove(event) {
+  if (!state.activeMarkerDrag) {
+    return;
+  }
+  if (event.pointerId !== state.activeMarkerDrag.pointerId) {
+    return;
+  }
+  updateDraggedMarkerFromPointer(event);
+}
+
+function onSensorMapPointerEnd(event) {
+  if (!state.activeMarkerDrag) {
+    return;
+  }
+  if (event.pointerId !== state.activeMarkerDrag.pointerId) {
+    return;
+  }
+
+  const active = state.activeMarkerDrag;
+  if (active.element) {
+    active.element.classList.remove("dragging");
+    if (
+      typeof active.element.releasePointerCapture === "function" &&
+      active.element.hasPointerCapture(event.pointerId)
+    ) {
+      active.element.releasePointerCapture(event.pointerId);
+    }
+  }
+  state.activeMarkerDrag = null;
+  persistMarkerOverrides();
+  renderSensorMap();
+}
+
+function initMapEditor() {
+  if (!dom.sensorBlips) {
+    return;
+  }
+  dom.sensorBlips.addEventListener("pointerdown", onSensorMapPointerDown);
+  dom.sensorBlips.addEventListener("pointermove", onSensorMapPointerMove);
+  window.addEventListener("pointerup", onSensorMapPointerEnd);
+  window.addEventListener("pointercancel", onSensorMapPointerEnd);
+}
+
+function registerMapEditorApi() {
+  window.sensorMapEditor = {
+    enableEditMode() {
+      state.mapEditMode = true;
+      renderSensorMap();
+      pushLog("MAP EDIT MODE ENABLED", "warn");
+    },
+    disableEditMode() {
+      state.mapEditMode = false;
+      renderSensorMap();
+      pushLog("MAP EDIT MODE DISABLED", "ok");
+    },
+    exportMarkers: exportCurrentMarkers,
+    resetMarkers: resetMarkerOverrides,
+  };
+}
+
 function prepareCanvas(canvas) {
   const ratio = window.devicePixelRatio || 1;
   const width = Math.max(320, Math.floor(canvas.clientWidth * ratio));
@@ -818,21 +1129,35 @@ function renderAnalysis() {
   drawFrequencyDomain(event);
 }
 
-function renderRadar() {
-  const points = state.liveEvents.slice(0, 10).map((event) => {
-    const seed = deterministicSeed(event.event_id);
-    const angle = ((seed % 360) * Math.PI) / 180;
-    const radius = 18 + (seed % 68);
-    const x = 50 + Math.cos(angle) * (radius * 0.42);
-    const y = 50 + Math.sin(angle) * (radius * 0.42);
-    const css = severityFromClassification(event.classification);
-    const color = css === "fail" ? "#ff6961" : css === "warn" ? "#f0d264" : "#8adf62";
-    return `
-      <span class="blip ${css}" style="left:${x.toFixed(2)}%;top:${y.toFixed(2)}%;background:${color};box-shadow:0 0 11px ${color};animation-delay:${(seed % 12) / 10}s"></span>
-    `;
-  });
+function renderSensorMap() {
+  if (!dom.sensorBlips) {
+    return;
+  }
 
-  dom.radarBlips.innerHTML = points.join("");
+  const points = getMergedSensorMarkers()
+    .filter(
+      (marker) =>
+        SHOW_ALL_SENSORS_ON_MAP ||
+        state.mapEditMode ||
+        state.latestStreamEventBySensor.has(marker.sensorId)
+    )
+    .map((marker) => {
+      const event = state.latestStreamEventBySensor.get(marker.sensorId) || null;
+      const dotClass = mapDotClass(event);
+      const x = clampPct(marker.xPct);
+      const y = clampPct(marker.yPct);
+      const seed = deterministicSeed(marker.sensorId);
+      const baseLabel = markerTooltipLabel(marker.sensorId);
+      const editHint = state.mapEditMode ? ` (${x.toFixed(2)}%, ${y.toFixed(2)}%)` : "";
+      const title = `${baseLabel}${editHint}`;
+      const editClass = state.mapEditMode ? " editable" : "";
+
+      return `
+        <span class="sensor-dot ${dotClass}${editClass}" data-sensor-id="${marker.sensorId}" title="${title}" style="left:${x.toFixed(2)}%;top:${y.toFixed(2)}%;animation-delay:${(seed % 12) / 10}s"></span>
+      `;
+    });
+
+  dom.sensorBlips.innerHTML = points.join("");
 }
 
 function renderClock() {
@@ -843,7 +1168,7 @@ function renderAll() {
   renderStatus();
   renderLiveTable();
   renderArchiveTable();
-  renderRadar();
+  renderSensorMap();
   renderAnalysis();
 }
 
@@ -861,12 +1186,20 @@ function initResizeHandler() {
 }
 
 async function boot() {
+  state.markerOverrides = loadMarkerOverrides();
+  state.mapEditMode = new URLSearchParams(window.location.search).get(MAP_EDITOR_QUERY_PARAM) === "1";
+  registerMapEditorApi();
+
   applyDensityProfile();
   renderClock();
   setInterval(renderClock, 1000);
   initResizeHandler();
+  initMapEditor();
 
   pushLog("DASHBOARD INITIALIZED", "ok");
+  if (state.mapEditMode) {
+    pushLog("MAP EDIT MODE ACTIVE (?editSensors=1)", "warn");
+  }
   await loadArchiveEvents();
   connectEventStream();
   await pollHealth();

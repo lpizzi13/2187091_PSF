@@ -221,74 +221,108 @@ h3 {
   min-height: calc(var(--u) * 2.3);
 }
 
-.radar-frame {
+.map-frame {
   flex: 1;
   min-height: 0;
   margin: var(--pad);
   border: 1px solid var(--line-soft);
-  background: radial-gradient(circle, rgba(92, 149, 78, 0.27), rgba(7, 20, 17, 0.86) 72%);
+  background: linear-gradient(145deg, rgba(6, 18, 15, 0.95), rgba(4, 12, 10, 0.95));
   position: relative;
   overflow: hidden;
 }
 
-.radar-grid {
+.sensor-map {
   position: absolute;
   inset: clamp(6px, calc(var(--u) * 0.75), 12px);
-  border: 1px solid rgba(141, 215, 104, 0.35);
-  border-radius: 50%;
   overflow: hidden;
-  background:
-    repeating-radial-gradient(circle, rgba(146, 219, 108, 0.18) 0, rgba(146, 219, 108, 0.18) 1px, transparent 1px, transparent 40px),
-    linear-gradient(0deg, transparent 49.5%, rgba(146, 219, 108, 0.2) 49.5%, rgba(146, 219, 108, 0.2) 50.5%, transparent 50.5%),
-    linear-gradient(90deg, transparent 49.5%, rgba(146, 219, 108, 0.2) 49.5%, rgba(146, 219, 108, 0.2) 50.5%, transparent 50.5%);
+  display: grid;
+  place-items: center;
+  background: transparent;
 }
 
-.radar-sweep {
-  position: absolute;
-  inset: -40%;
-  background: conic-gradient(
-    from 0deg,
-    rgba(129, 255, 138, 0.28) 0deg,
-    rgba(129, 255, 138, 0.14) 35deg,
-    rgba(129, 255, 138, 0.03) 65deg,
-    transparent 120deg
-  );
-  transform-origin: 50% 50%;
-  animation: sweep 4.8s linear infinite;
+.sensor-map-canvas {
+  position: relative;
+  width: fit-content;
+  height: fit-content;
+  max-width: 100%;
+  max-height: 100%;
+  border: 1px solid rgba(141, 215, 104, 0.35);
+  background: linear-gradient(145deg, rgba(4, 16, 14, 0.58), rgba(4, 16, 14, 0.58));
 }
 
-@keyframes sweep {
-  from {
-    transform: rotate(0deg);
-  }
-  to {
-    transform: rotate(360deg);
-  }
+.sensor-map-image {
+  display: block;
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: 100%;
 }
 
-.radar-blips {
+.sensor-map-canvas::after {
+  content: "";
   position: absolute;
   inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(0deg, rgba(127, 190, 105, 0.1) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(127, 190, 105, 0.1) 1px, transparent 1px);
+  background-size: clamp(26px, calc(var(--u) * 2.9), 52px) clamp(26px, calc(var(--u) * 2.9), 52px);
+  mix-blend-mode: screen;
 }
 
-.blip {
+.sensor-blips {
   position: absolute;
-  width: clamp(5px, calc(var(--u) * 0.55), 9px);
-  height: clamp(5px, calc(var(--u) * 0.55), 9px);
-  border-radius: 50%;
-  background: #ff5f5f;
-  box-shadow: 0 0 10px rgba(255, 95, 95, 0.8);
-  transform: translate(-50%, -50%);
-  animation: blink 2.3s ease-in-out infinite;
+  inset: 0;
+  z-index: 1;
 }
 
-@keyframes blink {
+.sensor-dot {
+  --dot-color: #89a69a;
+  position: absolute;
+  width: clamp(7px, calc(var(--u) * 0.66), 12px);
+  height: clamp(7px, calc(var(--u) * 0.66), 12px);
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  border: 1px solid rgba(10, 18, 14, 0.8);
+  background: var(--dot-color);
+  box-shadow: 0 0 10px var(--dot-color);
+  animation: map-pulse 1.8s ease-in-out infinite;
+}
+
+.sensor-dot.editable {
+  cursor: grab;
+}
+
+.sensor-dot.editable.dragging {
+  cursor: grabbing;
+}
+
+.sensor-dot.idle {
+  animation: none;
+  opacity: 0.8;
+}
+
+.sensor-dot.ok {
+  --dot-color: var(--ok);
+}
+
+.sensor-dot.warn {
+  --dot-color: var(--warn);
+}
+
+.sensor-dot.fail {
+  --dot-color: var(--fail);
+}
+
+@keyframes map-pulse {
   0%,
   100% {
-    opacity: 0.55;
+    opacity: 0.6;
+    transform: translate(-50%, -50%) scale(0.95);
   }
   50% {
     opacity: 1;
+    transform: translate(-50%, -50%) scale(1.15);
   }
 }
 
