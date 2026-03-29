@@ -76,7 +76,7 @@ services:
       - BROKER_URL=ws://broker:8000/data
       - SAMPLING_RATE_HZ=20.0
       - WINDOW_SIZE=128
-      - HOP_SIZE=32
+      - HOP_SIZE=64
       - MIN_EVENT_GAP_SECONDS=4.0
       - PORT=8000
     healthcheck:

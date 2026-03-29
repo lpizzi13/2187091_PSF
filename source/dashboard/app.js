@@ -19,6 +19,7 @@ const dom = {
   radarBlips: document.getElementById("radarBlips"),
   analysisTitle: document.getElementById("analysisTitle"),
   detailSensor: document.getElementById("detailSensor"),
+  detailName: document.getElementById("detailName"),
   detailLocation: document.getElementById("detailLocation"),
   detailUtc: document.getElementById("detailUtc"),
   detailFreq: document.getElementById("detailFreq"),
@@ -120,6 +121,12 @@ function firstDefined(values, fallback) {
     }
   }
   return fallback;
+}
+
+function setText(node, value) {
+  if (node) {
+    node.textContent = value;
+  }
 }
 
 function applyDensityProfile() {
@@ -311,6 +318,10 @@ function normalizeEvent(raw) {
 
   const eventId = raw.event_id || raw.eventId || raw.id;
   const sensorId = raw.sensor_id || raw.sensorId || "unknown";
+  const sensorNameRaw = firstDefined([raw.sensor_name, raw.sensorName, raw.name], null);
+  const sensorName = typeof sensorNameRaw === "string" && sensorNameRaw.trim() !== ""
+    ? sensorNameRaw.trim()
+    : null;
   const classification = (
     raw.classification ||
     raw.eventType ||
@@ -349,6 +360,7 @@ function normalizeEvent(raw) {
   return {
     event_id: eventId,
     sensor_id: String(sensorId),
+    sensor_name: sensorName,
     classification,
     dominant_frequency_hz: Number.isFinite(dominantFrequency) ? dominantFrequency : null,
     timestamp,
@@ -379,6 +391,7 @@ function mergeLiveEvent(incoming, source = "event-live") {
     if (new Date(incoming.timestamp).getTime() > new Date(existing.timestamp).getTime()) {
       existing.timestamp = incoming.timestamp;
       existing.sensor_id = incoming.sensor_id;
+      existing.sensor_name = incoming.sensor_name;
       existing.classification = incoming.classification;
       existing.dominant_frequency_hz = incoming.dominant_frequency_hz;
       existing.region = incoming.region;
@@ -803,30 +816,34 @@ function drawFrequencyDomain(event) {
 function renderAnalysis() {
   const event = getSelectedEvent();
   if (!event) {
-    dom.analysisTitle.textContent = "NO EVENT SELECTED";
-    dom.detailSensor.textContent = "-";
-    dom.detailLocation.textContent = "-";
-    dom.detailUtc.textContent = "-";
-    dom.detailFreq.textContent = "-";
-    dom.detailType.textContent = "-";
-    dom.detailReplica.textContent = "-";
+    setText(dom.analysisTitle, "NO EVENT SELECTED");
+    setText(dom.detailSensor, "-");
+    setText(dom.detailName, "-");
+    setText(dom.detailLocation, "-");
+    setText(dom.detailUtc, "-");
+    setText(dom.detailFreq, "-");
+    setText(dom.detailType, "-");
+    setText(dom.detailReplica, "-");
     drawTimeDomain(null);
     drawFrequencyDomain(null);
     return;
   }
 
-  dom.analysisTitle.textContent = `ID ${shortId(event.event_id)}`;
-  dom.detailSensor.textContent = event.sensor_id;
-  dom.detailLocation.textContent =
+  setText(dom.analysisTitle, `ID ${shortId(event.event_id)}`);
+  setText(dom.detailSensor, event.sensor_id);
+  setText(dom.detailName, event.sensor_name || "-");
+  setText(
+    dom.detailLocation,
     event.region ||
-    (event.coordinates && (event.coordinates.lat || event.coordinates.lon)
-      ? `${firstDefined([event.coordinates.lat], "-")}, ${firstDefined([event.coordinates.lon], "-")}`
-      : "Unknown");
-  dom.detailUtc.textContent = toUtcDateTime(event.timestamp);
-  dom.detailFreq.textContent = frequencyText(event.dominant_frequency_hz);
-  dom.detailType.textContent = classificationLabel(event.classification);
+      (event.coordinates && (event.coordinates.lat || event.coordinates.lon)
+        ? `${firstDefined([event.coordinates.lat], "-")}, ${firstDefined([event.coordinates.lon], "-")}`
+        : "Unknown")
+  );
+  setText(dom.detailUtc, toUtcDateTime(event.timestamp));
+  setText(dom.detailFreq, frequencyText(event.dominant_frequency_hz));
+  setText(dom.detailType, classificationLabel(event.classification));
   dom.detailType.className = classificationCss(event.classification);
-  dom.detailReplica.textContent = event.detected_by ? replicaLabel(event.detected_by) : "-";
+  setText(dom.detailReplica, event.detected_by ? replicaLabel(event.detected_by) : "-");
 
   drawTimeDomain(event);
   drawFrequencyDomain(event);

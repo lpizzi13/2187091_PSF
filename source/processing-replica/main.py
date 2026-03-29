@@ -89,6 +89,7 @@ DB_RETRY_SECONDS = env_float("DB_RETRY_SECONDS", 2.0)
 
 @dataclass(frozen=True)
 class SensorMetadata:
+    name: str | None
     region: str | None
     latitude: float | None
     longitude: float | None
@@ -210,11 +211,12 @@ def analyze_measurement(sensor_id: str, timestamp: Any, value: float) -> dict[st
     event_time = parse_timestamp(timestamp)
     event_iso = isoformat_utc(event_time)
     event_bucket = compute_event_bucket(event_time)
-    metadata = state.sensor_metadata.get(sensor_id, SensorMetadata(None, None, None))
+    metadata = state.sensor_metadata.get(sensor_id, SensorMetadata(None, None, None, None))
 
     return {
         "event_id": build_event_id(sensor_id, event_bucket, classification),
         "sensor_id": sensor_id,
+        "sensor_name": metadata.name,
         "region": metadata.region,
         "coordinates": {"lat": metadata.latitude, "lon": metadata.longitude},
         "timestamp": event_iso,
@@ -298,7 +300,9 @@ async def refresh_sensor_metadata() -> None:
                 longitude = float(lon_value) if isinstance(lon_value, (int, float)) else None
 
             region = item.get("region")
+            name = item.get("name")
             metadata[sensor_id] = SensorMetadata(
+                name=name if isinstance(name, str) else None,
                 region=region if isinstance(region, str) else None,
                 latitude=latitude,
                 longitude=longitude,
@@ -576,9 +580,17 @@ def serialize_row(row: dict[str, Any]) -> dict[str, Any]:
     else:
         event_timestamp = isoformat_utc(utc_now())
 
+    sensor_id = row.get("sensor_id")
+    sensor_metadata = (
+        state.sensor_metadata.get(sensor_id, SensorMetadata(None, None, None, None))
+        if isinstance(sensor_id, str)
+        else SensorMetadata(None, None, None, None)
+    )
+
     return {
         "event_id": row.get("event_id"),
-        "sensor_id": row.get("sensor_id"),
+        "sensor_id": sensor_id,
+        "sensor_name": sensor_metadata.name,
         "region": row.get("region"),
         "coordinates": {
             "lat": row.get("latitude"),
