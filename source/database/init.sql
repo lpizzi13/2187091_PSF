@@ -2,7 +2,7 @@ CREATE DATABASE IF NOT EXISTS seismic_db;
 USE seismic_db;
 
 CREATE TABLE IF NOT EXISTS seismic_events (
-    event_id VARCHAR(255) PRIMARY KEY, -- Hash deterministico (sensor_id + timestamp)
+    event_id VARCHAR(255) PRIMARY KEY, -- Hash deterministico (sensor_id + classification + time-bucket)
     sensor_id VARCHAR(50) NOT NULL,
     region VARCHAR(100),
     latitude FLOAT,

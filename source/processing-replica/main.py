@@ -66,7 +66,20 @@ if not SIMULATOR_API_URL:
 DB_URL = os.getenv("DB_URL", "mysql://admin:secret@localhost:3306/seismic_db")
 SAMPLING_RATE_HZ = env_float("SAMPLING_RATE_HZ", 20.0)
 WINDOW_SIZE = env_int("WINDOW_SIZE", 128)
+HOP_SIZE_RAW = env_int("HOP_SIZE", 32)
+HOP_SIZE = min(HOP_SIZE_RAW, WINDOW_SIZE)
+if HOP_SIZE_RAW != HOP_SIZE:
+    logger.warning(
+        "HOP_SIZE=%d is larger than WINDOW_SIZE=%d. Clamping HOP_SIZE to %d.",
+        HOP_SIZE_RAW,
+        WINDOW_SIZE,
+        HOP_SIZE,
+    )
 MIN_EVENT_GAP_SECONDS = env_float("MIN_EVENT_GAP_SECONDS", 4.0)
+EVENT_DEDUP_SECONDS = env_float(
+    "EVENT_DEDUP_SECONDS",
+    max(MIN_EVENT_GAP_SECONDS * 4.0, 16.0),
+)
 
 BROKER_RECONNECT_SECONDS = env_float("BROKER_RECONNECT_SECONDS", 1.5)
 CONTROL_RECONNECT_SECONDS = env_float("CONTROL_RECONNECT_SECONDS", 2.0)
@@ -76,6 +89,7 @@ DB_RETRY_SECONDS = env_float("DB_RETRY_SECONDS", 2.0)
 
 @dataclass(frozen=True)
 class SensorMetadata:
+    name: str | None
     region: str | None
     latitude: float | None
     longitude: float | None
@@ -89,6 +103,7 @@ class ReplicaState:
         self.stop_event = asyncio.Event()
 
         self.sensor_windows: dict[str, deque[float]] = {}
+        self.sensor_sample_counts: dict[str, int] = {}
         self.last_emitted_by_sensor: dict[str, tuple[str, float]] = {}
         self.sensor_metadata: dict[str, SensorMetadata] = {}
 
@@ -145,8 +160,17 @@ def classify_frequency(freq_hz: float) -> str | None:
     return None
 
 
-def build_event_id(sensor_id: str, timestamp_iso: str, classification: str) -> str:
-    raw = f"{sensor_id}|{timestamp_iso}|{classification}"
+def compute_event_bucket(timestamp: datetime) -> int:
+    """
+    Map an event timestamp to a shared time bucket so all replicas derive
+    the same logical event id for near-simultaneous detections.
+    """
+    gap = max(MIN_EVENT_GAP_SECONDS, 0.1)
+    return int((timestamp.timestamp() / gap) + 0.5)
+
+
+def build_event_id(sensor_id: str, event_bucket: int, classification: str) -> str:
+    raw = f"{sensor_id}|{classification}|{event_bucket}"
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
     return f"evt-{digest}"
 
@@ -155,8 +179,12 @@ def analyze_measurement(sensor_id: str, timestamp: Any, value: float) -> dict[st
     state.measurements_seen += 1
 
     window = state.sensor_windows.setdefault(sensor_id, deque(maxlen=WINDOW_SIZE))
+    sample_count = state.sensor_sample_counts.get(sensor_id, 0) + 1
+    state.sensor_sample_counts[sensor_id] = sample_count
     window.append(float(value))
     if len(window) < WINDOW_SIZE:
+        return None
+    if sample_count > WINDOW_SIZE and (sample_count - WINDOW_SIZE) % HOP_SIZE != 0:
         return None
 
     samples = np.asarray(window, dtype=np.float64)
@@ -182,11 +210,13 @@ def analyze_measurement(sensor_id: str, timestamp: Any, value: float) -> dict[st
 
     event_time = parse_timestamp(timestamp)
     event_iso = isoformat_utc(event_time)
-    metadata = state.sensor_metadata.get(sensor_id, SensorMetadata(None, None, None))
+    event_bucket = compute_event_bucket(event_time)
+    metadata = state.sensor_metadata.get(sensor_id, SensorMetadata(None, None, None, None))
 
     return {
-        "event_id": build_event_id(sensor_id, event_iso, classification),
+        "event_id": build_event_id(sensor_id, event_bucket, classification),
         "sensor_id": sensor_id,
+        "sensor_name": metadata.name,
         "region": metadata.region,
         "coordinates": {"lat": metadata.latitude, "lon": metadata.longitude},
         "timestamp": event_iso,
@@ -270,7 +300,9 @@ async def refresh_sensor_metadata() -> None:
                 longitude = float(lon_value) if isinstance(lon_value, (int, float)) else None
 
             region = item.get("region")
+            name = item.get("name")
             metadata[sensor_id] = SensorMetadata(
+                name=name if isinstance(name, str) else None,
                 region=region if isinstance(region, str) else None,
                 latitude=latitude,
                 longitude=longitude,
@@ -290,11 +322,22 @@ async def metadata_refresh_loop() -> None:
         await asyncio.sleep(METADATA_REFRESH_SECONDS)
 
 
-async def persist_event(event: dict[str, Any]) -> bool:
+async def persist_event(event: dict[str, Any]) -> tuple[bool, str]:
     if state.db_pool is None:
         raise RuntimeError("DB pool is not initialized.")
 
     event_timestamp = parse_timestamp(event.get("timestamp")).replace(tzinfo=None)
+    dedup_window_seconds = max(1, int(round(EVENT_DEDUP_SECONDS)))
+
+    dedup_query = """
+        SELECT event_id
+        FROM seismic_events
+        WHERE sensor_id = %s
+          AND classification = %s
+          AND TIMESTAMPDIFF(SECOND, timestamp, %s) BETWEEN 0 AND %s
+        ORDER BY timestamp DESC
+        LIMIT 1
+    """
 
     query = """
         INSERT IGNORE INTO seismic_events (
@@ -323,8 +366,38 @@ async def persist_event(event: dict[str, Any]) -> bool:
 
     async with state.db_pool.acquire() as conn:
         async with conn.cursor() as cursor:
+            await cursor.execute(
+                dedup_query,
+                (
+                    event["sensor_id"],
+                    event["classification"],
+                    event_timestamp,
+                    dedup_window_seconds,
+                ),
+            )
+            existing_recent = await cursor.fetchone()
+            if isinstance(existing_recent, dict):
+                existing_id = existing_recent.get("event_id")
+                if isinstance(existing_id, str) and existing_id:
+                    return False, existing_id
+
             await cursor.execute(query, params)
-            return cursor.rowcount == 1
+            if cursor.rowcount == 1:
+                return True, event["event_id"]
+
+            # Fallback for races: if another replica inserted the same id
+            # concurrently, use the canonical id already stored.
+            await cursor.execute(
+                "SELECT event_id FROM seismic_events WHERE event_id = %s LIMIT 1",
+                (event["event_id"],),
+            )
+            existing_same_id = await cursor.fetchone()
+            if isinstance(existing_same_id, dict):
+                existing_id = existing_same_id.get("event_id")
+                if isinstance(existing_id, str) and existing_id:
+                    return False, existing_id
+
+    return False, event["event_id"]
 
 
 async def broadcast_realtime_event(event: dict[str, Any]) -> None:
@@ -398,7 +471,9 @@ async def broker_consumer_loop() -> None:
                     if detected_event is None:
                         continue
 
-                    inserted = await persist_event(detected_event)
+                    inserted, canonical_event_id = await persist_event(detected_event)
+                    if canonical_event_id != detected_event["event_id"]:
+                        detected_event["event_id"] = canonical_event_id
                     if inserted:
                         state.events_persisted += 1
                     else:
@@ -505,9 +580,17 @@ def serialize_row(row: dict[str, Any]) -> dict[str, Any]:
     else:
         event_timestamp = isoformat_utc(utc_now())
 
+    sensor_id = row.get("sensor_id")
+    sensor_metadata = (
+        state.sensor_metadata.get(sensor_id, SensorMetadata(None, None, None, None))
+        if isinstance(sensor_id, str)
+        else SensorMetadata(None, None, None, None)
+    )
+
     return {
         "event_id": row.get("event_id"),
-        "sensor_id": row.get("sensor_id"),
+        "sensor_id": sensor_id,
+        "sensor_name": sensor_metadata.name,
         "region": row.get("region"),
         "coordinates": {
             "lat": row.get("latitude"),
@@ -570,6 +653,7 @@ async def health() -> dict[str, Any]:
         "simulator_control_url": SIMULATOR_CONTROL_URL,
         "sampling_rate_hz": SAMPLING_RATE_HZ,
         "window_size": WINDOW_SIZE,
+        "hop_size": HOP_SIZE,
         "measurements_seen": state.measurements_seen,
         "events_persisted": state.events_persisted,
         "events_duplicates": state.events_duplicates,
