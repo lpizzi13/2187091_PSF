@@ -324,6 +324,16 @@ function normalizeEvent(raw) {
   );
   const timestamp = raw.timestamp || raw.startsAt || nowIso();
   const detectedBy = raw.detected_by || raw.detectedBy || raw.replica_id || null;
+  const persistedRaw = firstDefined([raw.persisted, raw.isPersisted], true);
+  let persisted = true;
+  if (typeof persistedRaw === "boolean") {
+    persisted = persistedRaw;
+  } else if (typeof persistedRaw === "number") {
+    persisted = persistedRaw !== 0;
+  } else if (typeof persistedRaw === "string") {
+    const normalizedPersisted = persistedRaw.trim().toLowerCase();
+    persisted = !(normalizedPersisted === "false" || normalizedPersisted === "0");
+  }
   const region = typeof raw.region === "string" ? raw.region : null;
   const coordinates = raw.coordinates && typeof raw.coordinates === "object"
     ? {
@@ -343,6 +353,7 @@ function normalizeEvent(raw) {
     dominant_frequency_hz: Number.isFinite(dominantFrequency) ? dominantFrequency : null,
     timestamp,
     detected_by: detectedBy ? String(detectedBy) : null,
+    persisted,
     region,
     coordinates,
   };
@@ -488,6 +499,9 @@ function connectEventStream() {
     const payload = safeJson(event.data);
     const normalized = normalizeEvent(payload);
     if (!normalized) {
+      return;
+    }
+    if (normalized.persisted === false) {
       return;
     }
 
