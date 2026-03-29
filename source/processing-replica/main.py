@@ -56,6 +56,11 @@ def env_int(name: str, default: int) -> int:
 
 
 REPLICA_ID = os.getenv("REPLICA_ID", socket.gethostname())
+PRIMARY_REPLICA_ID = os.getenv("PRIMARY_REPLICA_ID", "replica-primary")
+PRIMARY_REPLICA_HEALTH_URL = os.getenv(
+    "PRIMARY_REPLICA_HEALTH_URL",
+    f"http://{PRIMARY_REPLICA_ID}:8000/health",
+)
 BROKER_URL = os.getenv("BROKER_URL", "ws://localhost:8000/data")
 SIMULATOR_CONTROL_URL = os.getenv("SIMULATOR_CONTROL_URL", "http://localhost:8080/api/control")
 SIMULATOR_API_URL = os.getenv("SIMULATOR_API_URL", "").rstrip("/")
@@ -80,6 +85,10 @@ EVENT_DEDUP_SECONDS = env_float(
     "EVENT_DEDUP_SECONDS",
     max(MIN_EVENT_GAP_SECONDS * 4.0, 16.0),
 )
+PRIMARY_HEALTHCHECK_TTL_SECONDS = env_float("PRIMARY_HEALTHCHECK_TTL_SECONDS", 1.0)
+PRIMARY_HEALTHCHECK_TIMEOUT_SECONDS = env_float("PRIMARY_HEALTHCHECK_TIMEOUT_SECONDS", 0.8)
+DB_WRITER_LOCK_NAME = os.getenv("DB_WRITER_LOCK_NAME", "seismic_single_writer_lock")
+DB_WRITER_LOCK_TIMEOUT_SECONDS = max(0.1, env_float("DB_WRITER_LOCK_TIMEOUT_SECONDS", 2.0))
 
 BROKER_RECONNECT_SECONDS = env_float("BROKER_RECONNECT_SECONDS", 1.5)
 CONTROL_RECONNECT_SECONDS = env_float("CONTROL_RECONNECT_SECONDS", 2.0)
@@ -118,7 +127,10 @@ class ReplicaState:
         self.measurements_seen = 0
         self.events_persisted = 0
         self.events_duplicates = 0
+        self.events_skipped_non_writer = 0
         self.control_commands_seen = 0
+        self.primary_health_cached = False
+        self.primary_health_checked_at = 0.0
 
 
 state = ReplicaState()
@@ -322,6 +334,38 @@ async def metadata_refresh_loop() -> None:
         await asyncio.sleep(METADATA_REFRESH_SECONDS)
 
 
+async def is_primary_replica_healthy() -> bool:
+    if REPLICA_ID == PRIMARY_REPLICA_ID:
+        return True
+    if state.session is None:
+        return False
+
+    now = time.monotonic()
+    if now - state.primary_health_checked_at < max(0.1, PRIMARY_HEALTHCHECK_TTL_SECONDS):
+        return state.primary_health_cached
+
+    state.primary_health_checked_at = now
+    healthy = False
+    try:
+        async with state.session.get(
+            PRIMARY_REPLICA_HEALTH_URL,
+            timeout=PRIMARY_HEALTHCHECK_TIMEOUT_SECONDS,
+        ) as response:
+            healthy = response.status == 200
+    except Exception:
+        healthy = False
+
+    state.primary_health_cached = healthy
+    return healthy
+
+
+async def should_persist_on_this_replica() -> bool:
+    if REPLICA_ID == PRIMARY_REPLICA_ID:
+        return True
+    primary_healthy = await is_primary_replica_healthy()
+    return not primary_healthy
+
+
 async def persist_event(event: dict[str, Any]) -> tuple[bool, str]:
     if state.db_pool is None:
         raise RuntimeError("DB pool is not initialized.")
@@ -366,36 +410,59 @@ async def persist_event(event: dict[str, Any]) -> tuple[bool, str]:
 
     async with state.db_pool.acquire() as conn:
         async with conn.cursor() as cursor:
-            await cursor.execute(
-                dedup_query,
-                (
-                    event["sensor_id"],
-                    event["classification"],
-                    event_timestamp,
-                    dedup_window_seconds,
-                ),
-            )
-            existing_recent = await cursor.fetchone()
-            if isinstance(existing_recent, dict):
-                existing_id = existing_recent.get("event_id")
-                if isinstance(existing_id, str) and existing_id:
-                    return False, existing_id
+            lock_acquired = False
+            try:
+                await cursor.execute(
+                    "SELECT GET_LOCK(%s, %s) AS got_lock",
+                    (DB_WRITER_LOCK_NAME, DB_WRITER_LOCK_TIMEOUT_SECONDS),
+                )
+                lock_row = await cursor.fetchone()
+                got_lock = None
+                if isinstance(lock_row, dict):
+                    got_lock = lock_row.get("got_lock")
+                lock_acquired = int(got_lock or 0) == 1
+                if not lock_acquired:
+                    return False, event["event_id"]
 
-            await cursor.execute(query, params)
-            if cursor.rowcount == 1:
-                return True, event["event_id"]
+                await cursor.execute(
+                    dedup_query,
+                    (
+                        event["sensor_id"],
+                        event["classification"],
+                        event_timestamp,
+                        dedup_window_seconds,
+                    ),
+                )
+                existing_recent = await cursor.fetchone()
+                if isinstance(existing_recent, dict):
+                    existing_id = existing_recent.get("event_id")
+                    if isinstance(existing_id, str) and existing_id:
+                        return False, existing_id
 
-            # Fallback for races: if another replica inserted the same id
-            # concurrently, use the canonical id already stored.
-            await cursor.execute(
-                "SELECT event_id FROM seismic_events WHERE event_id = %s LIMIT 1",
-                (event["event_id"],),
-            )
-            existing_same_id = await cursor.fetchone()
-            if isinstance(existing_same_id, dict):
-                existing_id = existing_same_id.get("event_id")
-                if isinstance(existing_id, str) and existing_id:
-                    return False, existing_id
+                await cursor.execute(query, params)
+                if cursor.rowcount == 1:
+                    return True, event["event_id"]
+
+                # Fallback for races: if another replica inserted the same id
+                # concurrently, use the canonical id already stored.
+                await cursor.execute(
+                    "SELECT event_id FROM seismic_events WHERE event_id = %s LIMIT 1",
+                    (event["event_id"],),
+                )
+                existing_same_id = await cursor.fetchone()
+                if isinstance(existing_same_id, dict):
+                    existing_id = existing_same_id.get("event_id")
+                    if isinstance(existing_id, str) and existing_id:
+                        return False, existing_id
+            finally:
+                if lock_acquired:
+                    try:
+                        await cursor.execute(
+                            "SELECT RELEASE_LOCK(%s)",
+                            (DB_WRITER_LOCK_NAME,),
+                        )
+                    except Exception:
+                        pass
 
     return False, event["event_id"]
 
@@ -471,7 +538,12 @@ async def broker_consumer_loop() -> None:
                     if detected_event is None:
                         continue
 
-                    inserted, canonical_event_id = await persist_event(detected_event)
+                    if await should_persist_on_this_replica():
+                        inserted, canonical_event_id = await persist_event(detected_event)
+                    else:
+                        inserted, canonical_event_id = False, detected_event["event_id"]
+                        state.events_skipped_non_writer += 1
+
                     if canonical_event_id != detected_event["event_id"]:
                         detected_event["event_id"] = canonical_event_id
                     if inserted:
@@ -649,6 +721,13 @@ async def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "replica_id": REPLICA_ID,
+        "is_primary_replica": REPLICA_ID == PRIMARY_REPLICA_ID,
+        "primary_replica_id": PRIMARY_REPLICA_ID,
+        "primary_replica_health_url": PRIMARY_REPLICA_HEALTH_URL,
+        "primary_replica_healthy_cache": (
+            True if REPLICA_ID == PRIMARY_REPLICA_ID else state.primary_health_cached
+        ),
+        "db_writer_lock_name": DB_WRITER_LOCK_NAME,
         "broker_url": BROKER_URL,
         "simulator_control_url": SIMULATOR_CONTROL_URL,
         "sampling_rate_hz": SAMPLING_RATE_HZ,
@@ -657,6 +736,7 @@ async def health() -> dict[str, Any]:
         "measurements_seen": state.measurements_seen,
         "events_persisted": state.events_persisted,
         "events_duplicates": state.events_duplicates,
+        "events_skipped_non_writer": state.events_skipped_non_writer,
         "control_commands_seen": state.control_commands_seen,
         "known_sensors": len(state.sensor_metadata),
         "connected_ws_clients": len(state.ws_clients),

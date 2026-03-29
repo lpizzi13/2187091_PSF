@@ -2,7 +2,10 @@ const EXPECTED_REPLICAS = 3;
 const REPLICA_STALE_MS = 18000;
 const REPLICA_RECOVERY_MS = 12000;
 const HEALTH_POLL_MS = 4000;
-const ARCHIVE_POLL_MS = 12000;
+const ARCHIVE_POLL_MS = 5000;
+const STREAM_RECONNECT_DELAY_MS = 2500;
+const STREAM_INACTIVITY_TIMEOUT_MS = 20000;
+const STREAM_WATCHDOG_MS = 5000;
 let MAX_LIVE_EVENTS = 12;
 let MAX_LOG_ROWS = 16;
 
@@ -88,6 +91,8 @@ const state = {
   activeMarkerDrag: null,
   knownSensors: 0,
   selectedEventId: null,
+  lastStreamActivityAt: 0,
+  streamReconnectTimer: null,
   archiveFilters: {
     search: "",
     classification: "",
@@ -191,6 +196,28 @@ function setText(node, value) {
   if (node) {
     node.textContent = value;
   }
+}
+
+function markStreamActivity() {
+  state.lastStreamActivityAt = Date.now();
+}
+
+function scheduleStreamReconnect(reason) {
+  if (state.streamReconnectTimer) {
+    return;
+  }
+
+  if (reason) {
+    pushLog(reason, "warn");
+  }
+  state.streamConnected = false;
+  dom.streamState.textContent = "STREAM: RECONNECTING";
+  dom.streamState.className = "stream-state warn";
+
+  state.streamReconnectTimer = setTimeout(() => {
+    state.streamReconnectTimer = null;
+    connectEventStream();
+  }, STREAM_RECONNECT_DELAY_MS);
 }
 
 function applyDensityProfile() {
@@ -524,8 +551,9 @@ async function loadArchiveEvents() {
     const items = Array.isArray(payload.items) ? payload.items : [];
     updateArchiveEvents(items);
 
-    if (state.liveEvents.length === 0) {
-      for (const event of state.archiveEvents.slice(0, 10)) {
+    // Self-healing fallback for missed stream updates.
+    for (const event of state.archiveEvents.slice(0, 10)) {
+      if (state.liveEvents.every((row) => row.event_id !== event.event_id)) {
         mergeLiveEvent(event, "event-history");
       }
     }
@@ -559,12 +587,15 @@ async function pollHealth() {
 function connectEventStream() {
   if (state.stream) {
     state.stream.close();
+    state.stream = null;
   }
 
-  const stream = new EventSource("/api/events/stream");
+  const stream = new EventSource(`/api/events/stream?t=${Date.now()}`);
   state.stream = stream;
+  markStreamActivity();
 
   stream.onopen = () => {
+    markStreamActivity();
     state.streamConnected = true;
     dom.streamState.textContent = "STREAM: LIVE";
     dom.streamState.className = "stream-state ok";
@@ -572,6 +603,7 @@ function connectEventStream() {
   };
 
   stream.addEventListener("open", (event) => {
+    markStreamActivity();
     const payload = safeJson(event.data);
     if (payload && typeof payload.replica_id === "string") {
       registerReplica(payload.replica_id, "stream-open");
@@ -580,6 +612,7 @@ function connectEventStream() {
   });
 
   stream.addEventListener("heartbeat", (event) => {
+    markStreamActivity();
     const payload = safeJson(event.data);
     if (payload && typeof payload.replica_id === "string") {
       registerReplica(payload.replica_id, "stream-heartbeat");
@@ -588,12 +621,10 @@ function connectEventStream() {
   });
 
   stream.addEventListener("event", (event) => {
+    markStreamActivity();
     const payload = safeJson(event.data);
     const normalized = normalizeEvent(payload);
     if (!normalized) {
-      return;
-    }
-    if (normalized.persisted === false) {
       return;
     }
 
@@ -612,15 +643,27 @@ function connectEventStream() {
   });
 
   stream.onerror = () => {
-    if (state.streamConnected) {
-      pushLog("EVENT STREAM LOST, RETRYING", "warn");
+    if (state.stream === stream) {
+      stream.close();
+      state.stream = null;
     }
-    state.streamConnected = false;
-    dom.streamState.textContent = "STREAM: RECONNECTING";
-    dom.streamState.className = "stream-state warn";
-    stream.close();
-    setTimeout(connectEventStream, 2500);
+    scheduleStreamReconnect(state.streamConnected ? "EVENT STREAM LOST, RETRYING" : null);
   };
+}
+
+function monitorStreamLiveness() {
+  if (!state.streamConnected || !state.stream) {
+    return;
+  }
+  if (Date.now() - state.lastStreamActivityAt <= STREAM_INACTIVITY_TIMEOUT_MS) {
+    return;
+  }
+
+  if (state.stream) {
+    state.stream.close();
+    state.stream = null;
+  }
+  scheduleStreamReconnect("EVENT STREAM STALE, FORCING RECONNECT");
 }
 
 function getSelectedEvent() {
@@ -674,21 +717,21 @@ function renderStatus() {
   const parts = [];
   for (let slot = 1; slot <= slotsCount; slot += 1) {
     const replica = bySlot.get(slot);
-    let label = `P${slot}: N/A`;
+    let label = `R${slot}: N/A`;
     let css = "warn";
     if (replica) {
       const effective = effectiveReplicaState(replica);
       if (effective === "ok") {
-        label = `P${slot}: OK`;
+        label = `R${slot}: OK`;
         css = "ok";
       } else if (effective === "fail") {
-        label = `P${slot}: FAIL`;
+        label = `R${slot}: FAIL`;
         css = "fail";
       } else if (effective === "recovering") {
-        label = `P${slot}: REC`;
+        label = `R${slot}: REC`;
         css = "warn";
       } else {
-        label = `P${slot}: N/A`;
+        label = `R${slot}: N/A`;
         css = "warn";
       }
     }
@@ -1274,7 +1317,7 @@ function renderAnalysis() {
     event.region ||
     (event.coordinates && (event.coordinates.lat || event.coordinates.lon)
       ? `${firstDefined([event.coordinates.lat], "-")}, ${firstDefined([event.coordinates.lon], "-")}`
-      : "Unknown");
+      : "Unknown"));
   dom.detailUtc.textContent = toUtcTime(event.timestamp);
   dom.detailFreq.textContent = frequencyText(event.dominant_frequency_hz);
   dom.detailType.textContent = classificationLabel(event.classification);
@@ -1391,6 +1434,7 @@ async function boot() {
 
   setInterval(pollHealth, HEALTH_POLL_MS);
   setInterval(loadArchiveEvents, ARCHIVE_POLL_MS);
+  setInterval(monitorStreamLiveness, STREAM_WATCHDOG_MS);
   setInterval(() => {
     markStaleReplicas();
     renderStatus();
