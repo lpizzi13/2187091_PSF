@@ -120,10 +120,6 @@ async def sensor_stream_loop(state: BrokerState, sensor: SensorSummary) -> None:
                             "timestamp": data.get("timestamp"),
                             "value": data.get("value"),
                         }
-                        print(
-                            f"[BROKER_IN] {json.dumps(measurement, ensure_ascii=False)}",
-                            flush=True,
-                        )
                         await state.replica_connections.broadcast(measurement)
                     elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
                         break
