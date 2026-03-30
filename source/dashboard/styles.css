@@ -572,8 +572,9 @@ td.class-nuclear_like {
   flex-direction: column;
   gap: clamp(2px, calc(var(--u) * 0.22), 6px);
   font-size: var(--fs-xs);
-  overflow-y: auto;
+  overflow-y: scroll;
   overflow-x: hidden;
+  scrollbar-gutter: stable;
   scrollbar-width: thin;
   scrollbar-color: rgba(156, 240, 110, 0.42) rgba(11, 18, 23, 0.72);
   flex: 1;

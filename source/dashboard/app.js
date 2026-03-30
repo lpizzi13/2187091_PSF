@@ -7,7 +7,7 @@ const STREAM_RECONNECT_DELAY_MS = 2500;
 const STREAM_INACTIVITY_TIMEOUT_MS = 20000;
 const STREAM_WATCHDOG_MS = 5000;
 let MAX_LIVE_EVENTS = 12;
-let MAX_LOG_ROWS = 16;
+const LOG_HISTORY_LIMIT = 250;
 
 // Imposta a true solo durante il posizionamento manuale dei sensori sulla mappa.
 // Quando hai finito di piazzarli, metti false per mostrare i puntini solo su evento reale.
@@ -226,21 +226,17 @@ function applyDensityProfile() {
 
   if (h < 680 || w < 980) {
     MAX_LIVE_EVENTS = 6;
-    MAX_LOG_ROWS = 8;
   } else if (h < 820 || w < 1200) {
     MAX_LIVE_EVENTS = 8;
-    MAX_LOG_ROWS = 11;
   } else if (h < 980) {
     MAX_LIVE_EVENTS = 10;
-    MAX_LOG_ROWS = 14;
   } else {
     MAX_LIVE_EVENTS = 12;
-    MAX_LOG_ROWS = 18;
   }
 
   state.liveEvents = state.liveEvents.slice(0, MAX_LIVE_EVENTS);
   state.archiveEvents = state.archiveEvents.slice(0, 80);
-  state.logs = state.logs.slice(0, MAX_LOG_ROWS);
+  state.logs = state.logs.slice(0, LOG_HISTORY_LIMIT);
 }
 
 function pushLog(message, level = "ok") {
@@ -250,7 +246,7 @@ function pushLog(message, level = "ok") {
     level,
   };
   state.logs.unshift(entry);
-  state.logs = state.logs.slice(0, MAX_LOG_ROWS);
+  state.logs = state.logs.slice(0, LOG_HISTORY_LIMIT);
   renderLogs();
 }
 
