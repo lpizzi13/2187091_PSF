@@ -1,19 +1,19 @@
-# Seismic Analysis Platform
+﻿# Seismic Analysis Platform
 
 ## 1. System Overview
 
 The goal of this project is to design and implement a distributed, fault-tolerant seismic analysis platform.
 
-The system ingests real-time seismic data from a simulator, distributes it across multiple processing replicas, performs frequency-domain analysis, classifies events, and persists them in a shared database. A frontend dashboard provides real-time monitoring and historical exploration of detected events.
+The system ingests real-time seismic data from a provided simulator, redistributes each measurement across replicated processing services, performs frequency-domain analysis, classifies events, and persists them with duplicate-safe behavior.
 
-The architecture is designed to ensure high availability and resilience, even in the presence of partial failures of processing replicas.
+A dashboard provides real-time monitoring and historical event exploration through a single gateway entry point.
 
 ---
 
 ## 2. User Stories
 
-| ID    | Area        | User Story |
-|-------|-------------|------------|
+| ID | Area | User Story |
+| --- | --- | --- |
 | US-01 | Ingestion | As a system, I want to discover available seismic sensors so that I can subscribe to active streams. |
 | US-02 | Ingestion | As a broker, I want to connect to sensor WebSocket streams so that I can receive real-time data. |
 | US-03 | Broker | As a broker, I want to distribute each measurement to all processing replicas so that analysis is replicated. |
@@ -39,54 +39,112 @@ The architecture is designed to ensure high availability and resilience, even in
 
 ## 3. High-Level Architecture
 
-The system is composed of the following components:
+Main components:
+- Simulator: exposes sensors, measurements, and control commands.
+- Broker: fan-out component that redistributes all sensor measurements.
+- Processing replicas: FFT analysis, classification, real-time emission, persistence.
+- Database: shared MySQL storage for classified events.
+- Gateway: single entry point and failover router toward replicas.
+- Dashboard: live and historical observability UI.
 
-•⁠  ⁠*Simulator*: provides seismic data streams (WebSocket) and control signals (SSE).
-•⁠  ⁠*Broker*: receives sensor data and redistributes it to all processing replicas (fan-out model).
-•⁠  ⁠*Processing Replicas*: perform FFT/DFT analysis, extract dominant frequencies, classify events, and persist them.
-•⁠  ⁠*Database*: shared storage for detected events with duplicate-safe behavior.
-•⁠  ⁠*Gateway*: single entry point for frontend requests, handling routing and health checks.
-•⁠  ⁠*Frontend Dashboard*: provides real-time and historical visualization of events.
-
-### Data Flow
-
-### Communication Protocols
-
-•⁠  ⁠Simulator → Broker: WebSocket (sensor data)
-•⁠  ⁠Simulator → Processing: SSE (control stream)
-•⁠  ⁠Broker → Processing: HTTP / internal messaging
-•⁠  ⁠Processing → Database: DB connection
-•⁠  ⁠Frontend ↔️ Gateway: HTTP / WebSocket
+Communication protocols:
+- Simulator -> Broker: WebSocket (per-sensor stream)
+- Simulator -> Processing replicas: SSE (`/api/control`)
+- Broker -> Processing replicas: WebSocket (`/data`)
+- Processing replicas -> Database: MySQL
+- Dashboard -> Gateway: HTTP + SSE
 
 ---
 
-## 4. Event Schema
+## 4. Standard Event Schema
 
-### Measurement Event
+### 4.1 Measurement Event (broker input/output)
 
-⁠ json
+```json
 {
   "sensor_id": "sensor-01",
   "timestamp": "2026-03-28T10:15:30Z",
   "value": 1.42
 }
+```
 
+### 4.2 Detected Event (processing output)
+
+```json
 {
-  "event_id": "sensor-01_2026-03-28T10:15:30Z_earthquake",
+  "event_id": "evt-0602ff0d1999a5a0c30e",
   "sensor_id": "sensor-01",
-  "region": "Replica Datacenter",
+  "sensor_name": "Borealis Ridge",
+  "region": "North Atlantic",
   "coordinates": {
-    "lat": 45.4642,
-    "lon": 9.19
+    "lat": 64.1466,
+    "lon": -21.9426
   },
-  "timestamp": "2026-03-28T10:15:30Z",
-  "dominant_frequency_hz": 2.4,
+  "timestamp": "2026-03-30T08:21:12.680217Z",
+  "dominant_frequency_hz": 1.5625,
   "classification": "earthquake",
-  "detected_by": "processing-replica-1"
+  "detected_by": "replica-primary",
+  "persisted": true
 }
- ⁠
+```
 
-Event classification is based on dominant frequency:
-•⁠  ⁠Earthquake: 0.5 ≤ f < 3.0 Hz
-•⁠  ⁠Conventional explosion: 3.0 ≤ f < 8.0 Hz
-•⁠  ⁠Nuclear-like event: f ≥ 8.0 Hz
+### 4.3 Event Classification Bands
+
+- Earthquake: `0.5 <= f < 3.0` Hz
+- Conventional explosion: `3.0 <= f < 8.0` Hz
+- Nuclear-like event: `f >= 8.0` Hz
+
+---
+
+## 5. Rule Model
+
+### RM-01 Sensor Discovery Rule
+On startup, broker and processing replicas must fetch the simulator sensor list from `/api/devices/` and refresh metadata periodically.
+
+### RM-02 Ingestion/Fan-Out Rule
+For every sensor sample received by broker, one normalized measurement message must be broadcast to all connected processing replicas.
+
+### RM-03 Windowing Rule
+Each processing replica keeps an in-memory sliding window per sensor.
+An event can be analyzed only when at least `WINDOW_SIZE` samples are available.
+
+### RM-04 Frequency Analysis Rule
+When a full window is available at hop boundaries (`HOP_SIZE`), the replica applies FFT/DFT equivalent processing, extracts dominant non-DC frequency, and maps it to a classification band.
+
+### RM-05 Classification Rule
+Classification must follow exactly these thresholds:
+- `0.5 <= f < 3.0`: `earthquake`
+- `3.0 <= f < 8.0`: `conventional_explosion`
+- `f >= 8.0`: `nuclear_like`
+
+### RM-06 Emission Cooldown Rule
+For each sensor, repeated consecutive events with same classification inside `MIN_EVENT_GAP_SECONDS` are ignored.
+
+### RM-07 Replica Failure Rule
+Each processing replica must subscribe to simulator control SSE (`/api/control`).
+On `{"command":"SHUTDOWN"}`, the receiving replica must terminate.
+
+### RM-08 Primary/Backup Write Rule
+Primary replica (`replica-primary`) is the preferred writer.
+Backup replicas persist only when primary health check fails.
+
+### RM-09 Duplicate-Safe Persistence Rule
+Before insert, replicas apply DB lock + recent-event dedup check and use `INSERT IGNORE` with deterministic `event_id` semantics to avoid duplicates.
+
+### RM-10 Gateway Routing Rule
+Gateway exposes a single entry point and routes to healthy processing replicas.
+Backup replicas are used automatically when primary is unavailable.
+
+### RM-11 Real-Time UI Rule
+Dashboard must receive live events from `/api/events/stream` and must keep historical visibility through `/api/events` with filters.
+
+---
+
+## 6. Non-Functional Requirements (Project-Level)
+
+- Availability: service remains operational under partial replica failures.
+- Fault tolerance: controlled shutdown of one replica must not stop overall event flow.
+- Scalability: processing logic runs concurrently for multiple sensors and replicas.
+- Consistency: duplicate-safe persistence in shared DB.
+- Observability: health endpoints, runtime counters, logs, and dashboard status views.
+- Reproducibility: full stack must start via `docker compose up`.
