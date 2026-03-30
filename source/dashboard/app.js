@@ -1,7 +1,10 @@
 const EXPECTED_REPLICAS = 3;
 const REPLICA_STALE_MS = 18000;
 const REPLICA_RECOVERY_MS = 12000;
+const REPLICA_HEALTH_FAIL_THRESHOLD = 2;
+const REPLICA_HEALTH_RECOVER_THRESHOLD = 3;
 const HEALTH_POLL_MS = 4000;
+const REPLICA_STATUS_POLL_MS = 1500;
 const ARCHIVE_POLL_MS = 5000;
 const STREAM_RECONNECT_DELAY_MS = 2500;
 const STREAM_INACTIVITY_TIMEOUT_MS = 20000;
@@ -78,6 +81,7 @@ const dom = {
 const state = {
   stream: null,
   streamConnected: false,
+  activeStreamReplicaId: null,
   liveEvents: [],
   archiveEvents: [],
   logs: [],
@@ -93,6 +97,7 @@ const state = {
   selectedEventId: null,
   lastStreamActivityAt: 0,
   streamReconnectTimer: null,
+  replicaStatusEndpointHealthy: true,
   archiveFilters: {
     search: "",
     classification: "",
@@ -318,6 +323,9 @@ function registerReplica(replicaId, source) {
       startedAt: null,
       controlCommandsSeen: 0,
       recoveringUntil: 0,
+      shuttingDown: false,
+      healthProbeFailures: 0,
+      healthProbeSuccesses: 0,
     });
     if (liveSource) {
       pushLog(`SUBSCRIPTION ACTIVE (${replicaLabel(replicaId)})`, "ok");
@@ -332,6 +340,10 @@ function registerReplica(replicaId, source) {
   const wasFail = existing.status === "fail";
   const wasUnknown = existing.status === "unknown";
   existing.lastSeen = now;
+  if (existing.shuttingDown) {
+    existing.status = "fail";
+    return;
+  }
   existing.status = "ok";
   if (wasFail) {
     existing.restarts += 1;
@@ -341,7 +353,112 @@ function registerReplica(replicaId, source) {
   }
 }
 
-function registerReplicaFromHealth(payload) {
+function markReplicaOfflineNow(replicaId, reason = "No heartbeat", options = {}) {
+  if (typeof replicaId !== "string" || replicaId.length === 0) {
+    return;
+  }
+
+  registerReplica(replicaId, "archive");
+  const replica = state.replicas.get(replicaId);
+  if (!replica) {
+    return;
+  }
+
+  if (options && options.shuttingDown === true) {
+    replica.shuttingDown = true;
+  }
+  if (replica.status !== "fail") {
+    pushLog(`${replicaLabel(replicaId)} OFFLINE (${reason})`, "fail");
+  }
+  replica.status = "fail";
+  replica.recoveringUntil = 0;
+}
+
+function markReplicaRecoveringNow(replicaId, reason = "Shutdown in progress") {
+  if (typeof replicaId !== "string" || replicaId.length === 0) {
+    return;
+  }
+
+  registerReplica(replicaId, "archive");
+  const replica = state.replicas.get(replicaId);
+  if (!replica) {
+    return;
+  }
+
+  const wasRecovering = effectiveReplicaState(replica) === "recovering";
+  replica.shuttingDown = false;
+  replica.healthProbeFailures = 0;
+  replica.healthProbeSuccesses = 0;
+  replica.status = "ok";
+  replica.lastSeen = Date.now();
+  replica.recoveringUntil = Date.now() + REPLICA_RECOVERY_MS;
+  if (!wasRecovering) {
+    pushLog(`${replicaLabel(replicaId)} RECOVERING (${reason})`, "warn");
+  }
+}
+
+function markReplicaProbeFailure(replicaId) {
+  if (typeof replicaId !== "string" || replicaId.length === 0) {
+    return;
+  }
+
+  registerReplica(replicaId, "archive");
+  const replica = state.replicas.get(replicaId);
+  if (!replica) {
+    return;
+  }
+
+  replica.healthProbeFailures = Number.isFinite(replica.healthProbeFailures)
+    ? replica.healthProbeFailures + 1
+    : 1;
+  replica.healthProbeSuccesses = 0;
+
+  if (replica.healthProbeFailures < REPLICA_HEALTH_FAIL_THRESHOLD) {
+    return;
+  }
+
+  markReplicaOfflineNow(replicaId, "Health unreachable");
+}
+
+function markReplicaProbeSuccess(replicaId) {
+  if (typeof replicaId !== "string" || replicaId.length === 0) {
+    return false;
+  }
+
+  registerReplica(replicaId, "archive");
+  const replica = state.replicas.get(replicaId);
+  if (!replica) {
+    return false;
+  }
+  replica.healthProbeFailures = 0;
+  replica.healthProbeSuccesses = Number.isFinite(replica.healthProbeSuccesses)
+    ? replica.healthProbeSuccesses + 1
+    : 1;
+
+  // Avoid FAIL/OK flapping: require multiple consecutive successful probes
+  // before declaring a failed replica online again.
+  if (replica.status === "fail" || replica.shuttingDown) {
+    return replica.healthProbeSuccesses >= REPLICA_HEALTH_RECOVER_THRESHOLD;
+  }
+
+  return true;
+}
+
+function setActiveStreamReplica(replicaId, source) {
+  if (typeof replicaId !== "string" || replicaId.length === 0) {
+    return;
+  }
+
+  const previous = state.activeStreamReplicaId;
+  if (previous && previous !== replicaId) {
+    markReplicaOfflineNow(previous, "Gateway switched upstream");
+  }
+
+  state.activeStreamReplicaId = replicaId;
+  registerReplica(replicaId, source);
+}
+
+function registerReplicaFromHealth(payload, source = "health") {
   if (!payload || typeof payload.replica_id !== "string") {
     return;
   }
@@ -358,28 +475,42 @@ function registerReplicaFromHealth(payload) {
     ? existing.startedAt
     : null;
 
-  registerReplica(replicaId, "health");
+  registerReplica(replicaId, source);
   const updated = state.replicas.get(replicaId);
   if (!updated) {
     return;
   }
+  updated.healthProbeFailures = 0;
+  updated.healthProbeSuccesses = Number.isFinite(updated.healthProbeSuccesses)
+    ? Math.max(updated.healthProbeSuccesses, REPLICA_HEALTH_RECOVER_THRESHOLD)
+    : REPLICA_HEALTH_RECOVER_THRESHOLD;
 
   if (Number.isFinite(controlCommandsSeen)) {
     if (previousCommands !== null && controlCommandsSeen > previousCommands) {
       pushLog(`SHUTDOWN CMD RECEIVED (${replicaLabel(replicaId)})`, "fail");
+      markReplicaOfflineNow(replicaId, "Shutdown command", { shuttingDown: true });
     }
     updated.controlCommandsSeen = controlCommandsSeen;
+  }
+
+  if (payload.shutdown_in_progress === true) {
+    markReplicaOfflineNow(replicaId, "Shutdown in progress", { shuttingDown: true });
   }
 
   if (startedAt) {
     if (previousStartedAt && previousStartedAt !== startedAt) {
       updated.restarts += 1;
       pushLog(`${replicaLabel(replicaId)} RESTARTED (new process)`, "warn");
-      updated.recoveringUntil = Date.now() + REPLICA_RECOVERY_MS;
-      updated.status = "ok";
-      updated.lastSeen = Date.now();
+      markReplicaRecoveringNow(replicaId, "Replica restart");
     }
     updated.startedAt = startedAt;
+  }
+
+  if (payload.shutdown_in_progress !== true && !updated.shuttingDown) {
+    updated.lastSeen = Date.now();
+    if (effectiveReplicaState(updated) !== "recovering") {
+      updated.status = "ok";
+    }
   }
 }
 
@@ -580,6 +711,58 @@ async function pollHealth() {
   }
 }
 
+async function pollReplicaStatuses() {
+  try {
+    const response = await fetch(`/api/replicas/status?t=${Date.now()}`, { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error(`replica status ${response.status}`);
+    }
+
+    const payload = await response.json();
+    const items = Array.isArray(payload.items) ? payload.items : [];
+
+    for (const item of items) {
+      if (!item || typeof item.replica_id !== "string") {
+        continue;
+      }
+
+      if (item.reachable !== true) {
+        markReplicaProbeFailure(item.replica_id);
+        continue;
+      }
+      const stable = markReplicaProbeSuccess(item.replica_id);
+      if (!stable) {
+        continue;
+      }
+
+      const healthPayload =
+        item.health && typeof item.health === "object"
+          ? item.health
+          : item;
+      registerReplicaFromHealth(
+        {
+          ...healthPayload,
+          replica_id: item.replica_id,
+        },
+        "health"
+      );
+    }
+
+    if (!state.replicaStatusEndpointHealthy) {
+      state.replicaStatusEndpointHealthy = true;
+      pushLog("REPLICA STATUS RESTORED", "ok");
+    }
+
+    markStaleReplicas();
+    renderStatus();
+  } catch (error) {
+    if (state.replicaStatusEndpointHealthy) {
+      state.replicaStatusEndpointHealthy = false;
+      pushLog(`REPLICA STATUS UNAVAILABLE (${error.message})`, "warn");
+    }
+  }
+}
+
 function connectEventStream() {
   if (state.stream) {
     state.stream.close();
@@ -602,7 +785,7 @@ function connectEventStream() {
     markStreamActivity();
     const payload = safeJson(event.data);
     if (payload && typeof payload.replica_id === "string") {
-      registerReplica(payload.replica_id, "stream-open");
+      setActiveStreamReplica(payload.replica_id, "stream-open");
       renderStatus();
     }
   });
@@ -611,7 +794,7 @@ function connectEventStream() {
     markStreamActivity();
     const payload = safeJson(event.data);
     if (payload && typeof payload.replica_id === "string") {
-      registerReplica(payload.replica_id, "stream-heartbeat");
+      setActiveStreamReplica(payload.replica_id, "stream-heartbeat");
       renderStatus();
     }
   });
@@ -622,6 +805,13 @@ function connectEventStream() {
     const normalized = normalizeEvent(payload);
     if (!normalized) {
       return;
+    }
+    if (normalized.persisted !== true) {
+      return;
+    }
+
+    if (normalized.detected_by) {
+      setActiveStreamReplica(normalized.detected_by, "event-live");
     }
 
     mergeLiveEvent(normalized);
@@ -639,6 +829,11 @@ function connectEventStream() {
   });
 
   stream.onerror = () => {
+    if (state.activeStreamReplicaId) {
+      markReplicaOfflineNow(state.activeStreamReplicaId, "Stream disconnected");
+      state.activeStreamReplicaId = null;
+      renderStatus();
+    }
     if (state.stream === stream) {
       stream.close();
       state.stream = null;
@@ -653,6 +848,12 @@ function monitorStreamLiveness() {
   }
   if (Date.now() - state.lastStreamActivityAt <= STREAM_INACTIVITY_TIMEOUT_MS) {
     return;
+  }
+
+  if (state.activeStreamReplicaId) {
+    markReplicaOfflineNow(state.activeStreamReplicaId, "Stream stale");
+    state.activeStreamReplicaId = null;
+    renderStatus();
   }
 
   if (state.stream) {
@@ -1425,10 +1626,12 @@ async function boot() {
     pushLog("MAP EDIT MODE ACTIVE (?editSensors=1)", "warn");
   }
   await loadArchiveEvents();
+  await pollReplicaStatuses();
   connectEventStream();
   await pollHealth();
 
   setInterval(pollHealth, HEALTH_POLL_MS);
+  setInterval(pollReplicaStatuses, REPLICA_STATUS_POLL_MS);
   setInterval(loadArchiveEvents, ARCHIVE_POLL_MS);
   setInterval(monitorStreamLiveness, STREAM_WATCHDOG_MS);
   setInterval(() => {

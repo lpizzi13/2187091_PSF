@@ -72,6 +72,7 @@ services:
       - REPLICA_ID=replica-primary
       - PRIMARY_REPLICA_ID=replica-primary
       - PRIMARY_REPLICA_HEALTH_URL=http://replica-primary:8000/health
+      - REPLICA_IDS=replica-primary,replica-backup-1,replica-backup-2
       - DB_WRITER_LOCK_NAME=seismic_single_writer_lock
       - DB_URL=mysql://admin:secret@db:3306/seismic_db
       - SIMULATOR_API_URL=http://simulator:8080
@@ -106,6 +107,7 @@ services:
       - REPLICA_ID=replica-backup-1
       - PRIMARY_REPLICA_ID=replica-primary
       - PRIMARY_REPLICA_HEALTH_URL=http://replica-primary:8000/health
+      - REPLICA_IDS=replica-primary,replica-backup-1,replica-backup-2
       - DB_WRITER_LOCK_NAME=seismic_single_writer_lock
       - DB_URL=mysql://admin:secret@db:3306/seismic_db
       - SIMULATOR_API_URL=http://simulator:8080
@@ -113,8 +115,8 @@ services:
       - BROKER_URL=ws://broker:8000/data
       - SAMPLING_RATE_HZ=20.0
       - WINDOW_SIZE=128
-      - HOP_SIZE=32
-      - MIN_EVENT_GAP_SECONDS=4.0
+      - HOP_SIZE=64
+      - MIN_EVENT_GAP_SECONDS=8.0
       - PORT=8000
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2).read()\" >/dev/null 2>&1 || exit 1"]
@@ -140,6 +142,7 @@ services:
       - REPLICA_ID=replica-backup-2
       - PRIMARY_REPLICA_ID=replica-primary
       - PRIMARY_REPLICA_HEALTH_URL=http://replica-primary:8000/health
+      - REPLICA_IDS=replica-primary,replica-backup-1,replica-backup-2
       - DB_WRITER_LOCK_NAME=seismic_single_writer_lock
       - DB_URL=mysql://admin:secret@db:3306/seismic_db
       - SIMULATOR_API_URL=http://simulator:8080
@@ -147,8 +150,8 @@ services:
       - BROKER_URL=ws://broker:8000/data
       - SAMPLING_RATE_HZ=20.0
       - WINDOW_SIZE=128
-      - HOP_SIZE=32
-      - MIN_EVENT_GAP_SECONDS=4.0
+      - HOP_SIZE=64
+      - MIN_EVENT_GAP_SECONDS=8.0
       - PORT=8000
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2).read()\" >/dev/null 2>&1 || exit 1"]

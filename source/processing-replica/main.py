@@ -5,7 +5,6 @@ import hashlib
 import json
 import logging
 import os
-import signal
 import socket
 import time
 from collections import deque
@@ -55,6 +54,11 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def env_csv(name: str, default: str) -> list[str]:
+    raw_value = os.getenv(name, default)
+    return [item.strip() for item in raw_value.split(",") if item.strip()]
+
+
 REPLICA_ID = os.getenv("REPLICA_ID", socket.gethostname())
 PRIMARY_REPLICA_ID = os.getenv("PRIMARY_REPLICA_ID", "replica-primary")
 PRIMARY_REPLICA_HEALTH_URL = os.getenv(
@@ -89,6 +93,18 @@ PRIMARY_HEALTHCHECK_TTL_SECONDS = env_float("PRIMARY_HEALTHCHECK_TTL_SECONDS", 1
 PRIMARY_HEALTHCHECK_TIMEOUT_SECONDS = env_float("PRIMARY_HEALTHCHECK_TIMEOUT_SECONDS", 0.8)
 DB_WRITER_LOCK_NAME = os.getenv("DB_WRITER_LOCK_NAME", "seismic_single_writer_lock")
 DB_WRITER_LOCK_TIMEOUT_SECONDS = max(0.1, env_float("DB_WRITER_LOCK_TIMEOUT_SECONDS", 2.0))
+SHUTDOWN_FORCE_EXIT_AFTER_SECONDS = max(
+    0.0,
+    env_float("SHUTDOWN_FORCE_EXIT_AFTER_SECONDS", 3.0),
+)
+REPLICA_IDS = env_csv(
+    "REPLICA_IDS",
+    f"{PRIMARY_REPLICA_ID},replica-backup-1,replica-backup-2",
+)
+REPLICA_HEALTH_TIMEOUT_SECONDS = max(
+    0.1,
+    env_float("REPLICA_HEALTH_TIMEOUT_SECONDS", 0.8),
+)
 
 BROKER_RECONNECT_SECONDS = env_float("BROKER_RECONNECT_SECONDS", 1.5)
 CONTROL_RECONNECT_SECONDS = env_float("CONTROL_RECONNECT_SECONDS", 2.0)
@@ -129,6 +145,7 @@ class ReplicaState:
         self.events_duplicates = 0
         self.events_skipped_non_writer = 0
         self.control_commands_seen = 0
+        self.shutdown_in_progress = False
         self.primary_health_cached = False
         self.primary_health_checked_at = 0.0
 
@@ -553,7 +570,10 @@ async def broker_consumer_loop() -> None:
 
                     out_event = {**detected_event, "persisted": inserted}
                     print(f"[REPLICA_OUT] {json.dumps(out_event, ensure_ascii=False)}", flush=True)
-                    await broadcast_realtime_event(out_event)
+                    # Stream only canonical persisted events to avoid duplicate/triplet
+                    # notifications on the dashboard while replicas process in parallel.
+                    if inserted:
+                        await broadcast_realtime_event(out_event)
 
         except asyncio.CancelledError:
             raise
@@ -592,9 +612,15 @@ async def handle_control_event(event_type: str | None, data_lines: list[str]) ->
         command = raw_payload.strip().upper()
 
     if command == "SHUTDOWN":
+        if state.shutdown_in_progress:
+            return
+        state.shutdown_in_progress = True
         state.control_commands_seen += 1
         logger.error("SHUTDOWN command received. Terminating replica %s.", REPLICA_ID)
-        os.kill(os.getpid(), signal.SIGTERM)
+
+        # Hard-exit immediately to avoid hanging in half-shutdown state
+        # (process alive but HTTP listener closed), which causes health flapping.
+        os._exit(1)
 
 
 async def control_stream_loop() -> None:
@@ -738,6 +764,7 @@ async def health() -> dict[str, Any]:
         "events_duplicates": state.events_duplicates,
         "events_skipped_non_writer": state.events_skipped_non_writer,
         "control_commands_seen": state.control_commands_seen,
+        "shutdown_in_progress": state.shutdown_in_progress,
         "known_sensors": len(state.sensor_metadata),
         "connected_ws_clients": len(state.ws_clients),
         "connected_sse_clients": len(state.sse_subscribers),
@@ -745,6 +772,63 @@ async def health() -> dict[str, Any]:
         if state.last_broker_message_at
         else None,
         "started_at": isoformat_utc(state.started_at),
+    }
+
+
+async def collect_replica_health(replica_id: str) -> dict[str, Any]:
+    if replica_id == REPLICA_ID:
+        return {
+            "replica_id": replica_id,
+            "reachable": True,
+            "health": await health(),
+        }
+
+    if state.session is None:
+        return {
+            "replica_id": replica_id,
+            "reachable": False,
+            "error": "session_not_initialized",
+        }
+
+    replica_health_url = f"http://{replica_id}:8000/health"
+    timeout = aiohttp.ClientTimeout(total=REPLICA_HEALTH_TIMEOUT_SECONDS)
+    try:
+        async with state.session.get(replica_health_url, timeout=timeout) as response:
+            if response.status != 200:
+                return {
+                    "replica_id": replica_id,
+                    "reachable": False,
+                    "error": f"http_{response.status}",
+                }
+            payload = await response.json()
+            if not isinstance(payload, dict):
+                return {
+                    "replica_id": replica_id,
+                    "reachable": False,
+                    "error": "invalid_health_payload",
+                }
+            return {
+                "replica_id": replica_id,
+                "reachable": True,
+                "health": payload,
+            }
+    except Exception as exc:
+        return {
+            "replica_id": replica_id,
+            "reachable": False,
+            "error": str(exc),
+        }
+
+
+@app.get("/api/replicas/status")
+async def replicas_status() -> dict[str, Any]:
+    replica_ids = REPLICA_IDS or [REPLICA_ID]
+    items = await asyncio.gather(*(collect_replica_health(replica_id) for replica_id in replica_ids))
+    return {
+        "queried_by": REPLICA_ID,
+        "replica_ids": replica_ids,
+        "items": items,
+        "timestamp": isoformat_utc(utc_now()),
     }
 
 

@@ -346,4 +346,3 @@ Client-side polling + SSE subscription:
 # NOTES FOR DELIVERY SCOPE
 
 - LoFi mockups are intentionally not included in this file and are planned in a separate workflow, as requested.
-- Detailed NFR mapping per user story is provided in `booklets/user_stories_nfr.md`.
